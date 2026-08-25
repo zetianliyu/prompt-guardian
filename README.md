@@ -1,2 +1,0 @@
-# prompt-guardian
-prompt-guardian
