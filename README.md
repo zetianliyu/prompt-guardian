@@ -27,7 +27,9 @@ LLM review modes (same meaning as the AstrBot prototype):
 - `active`: review every group message
 - `disabled`: rules only; block on `medium` / `high`
 
-LLM JSON must report `is_injection: true` **and** `confidence >= 0.6` to confirm. Parse failures fail open (do not block). Handler exceptions fail open so a plugin bug cannot kill the bot.
+LLM JSON must report `is_injection: true` **and** `confidence >= 0.6` to confirm. The review prompt now requires a valid JSON object with concrete values, not placeholder text. If a review was actually attempted but its output is malformed, the message fails open; if no model is configured, local `medium` / `high` rules remain authoritative.
+
+Every review attempt is written to the plugin stderr log, including clean messages that are ultimately passed through. Each audit entry includes the local score/severity, selected review model, parsed verdict/reason, bounded raw model output, and final pass/block decision. The same records are persisted to `review_audit.jsonl` (configurable via `review_audit_path`), separately from blocked-message tickets in `incidents.jsonl`; passed messages are not privately notified to admins.
 
 ## Install
 

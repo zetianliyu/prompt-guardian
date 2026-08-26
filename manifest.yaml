@@ -4,7 +4,7 @@ metadata:
   author: dxzk
   name: PromptGuardian
   repository: 'https://github.com/zetianliyu/prompt-guardian'
-  version: 0.1.2
+  version: 0.1.3
   description:
     en_US: Rule-based plus LLM-reviewed prompt-injection guard. Blocks jailbreaks in group chats and files a ticket (group, user, question) for human follow-up.
     zh_Hans: 规则预筛 + LLM 复核的提示词注入防护。拦截群聊越狱，并记录「哪个群、哪个用户、问了什么」供人工客服处理。
@@ -77,8 +77,8 @@ spec:
         en_US: Notify via bot
         zh_Hans: 通知所用机器人
       description:
-        en_US: Bot used to send the admin private message. Empty = the bot that received the group message.
-        zh_Hans: 用来给管理员发私聊的机器人。留空则用当前收到群消息的那个 bot。
+        en_US: "Bot used to send the admin private message. Empty = the bot that received the group message. The plugin uses the selected bot's adapter to route through QQ, WeChat, WeCom, or another supported LangBot channel."
+        zh_Hans: "用来给管理员发私聊的机器人。留空则用当前收到群消息的那个 bot。插件会根据所选 bot 的适配器，通过 QQ、微信、企微或其他 LangBot 支持的私聊渠道发送。"
       default: ''
       required: false
 
@@ -112,8 +112,8 @@ spec:
         en_US: QQ official AppID
         zh_Hans: QQ 官方机器人 AppID
       description:
-        en_US: Required for real C2C admin DMs on QQ official bots. Same AppID as the bot in LangBot. Leave empty to skip HTTP C2C (group fallback still works).
-        zh_Hans: QQ 官方机器人要真正私聊管理员时必填，与 LangBot 里该 bot 的 AppID 相同。留空则不走 HTTP 私聊（仍可群内补发）。
+        en_US: "QQ official bots: AppID and AppSecret are read from LangBot bot info when the host exposes them. Otherwise fill these fields manually for direct C2C HTTP. Never reuse WeChat/WeCom tokens here."
+        zh_Hans: "QQ 官方机器人：如果 LangBot 宿主暴露了凭据，插件会从所选 bot 信息读取 AppID 和 AppSecret；否则请手动填写以使用 C2C HTTP。不要把微信/企微 token 填在这里。"
       default: ''
       required: false
 
@@ -123,8 +123,8 @@ spec:
         en_US: QQ official AppSecret
         zh_Hans: QQ 官方机器人 AppSecret
       description:
-        en_US: Used only to obtain an access token for proactive C2C. Never sent to the review LLM. Leave empty if you only need group fallback.
-        zh_Hans: 仅用于换取 access_token 以主动私聊，不会送给复核 LLM。只需要群内补发时可留空。
+        en_US: "Used only to obtain an access token for proactive C2C. If the selected LangBot bot exposes its secret, that value is preferred; this field is a compatibility fallback. Never sent to the review LLM."
+        zh_Hans: "仅用于换取 access_token 以主动私聊。如果所选 LangBot bot 暴露了 AppSecret，则优先使用宿主提供的值；此项是兼容旧版宿主的手动回退。不会送给复核 LLM。"
       default: ''
       required: false
 
@@ -192,6 +192,17 @@ spec:
         en_US: JSONL path relative to the plugin directory (or absolute).
         zh_Hans: 相对插件目录的 JSONL 路径（也可填绝对路径）。
       default: incidents.jsonl
+      required: false
+
+    - name: review_audit_path
+      type: string
+      label:
+        en_US: Review audit path
+        zh_Hans: 复核审计文件路径
+      description:
+        en_US: JSONL path for every message actually sent to the review LLM, including passed verdicts. Relative to the plugin directory or absolute.
+        zh_Hans: 记录每次实际送入复核 LLM 的消息（包括复核后放行）的 JSONL 路径。相对插件目录，也可填绝对路径。
+      default: review_audit.jsonl
       required: false
 
     - name: rule_medium_threshold

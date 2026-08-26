@@ -43,6 +43,7 @@ def check_syntax() -> None:
         os.path.join(LISTENER, "rule_overrides.py"),
         os.path.join(LISTENER, "ptd_core.py"),
         os.path.join(LISTENER, "admin_ids.py"),
+        os.path.join(LISTENER, "bot_credentials.py"),
         os.path.join(LISTENER, "qqofficial_c2c.py"),
         os.path.join(ROOT, "scripts", "verify_ptd.py"),
         os.path.join(ROOT, "scripts", "dump_rules.py"),
@@ -140,7 +141,7 @@ def check_unicode_rules() -> None:
 
 
 def check_llm_parser() -> None:
-    from default import parse_llm_response, llm_confirms_injection
+    from default import DefaultEventListener, parse_llm_response, llm_confirms_injection
 
     parsed = parse_llm_response(
         '```json\n{"is_injection": true, "confidence": 0.9, "reason": "越狱"}\n```'
@@ -154,10 +155,31 @@ def check_llm_parser() -> None:
         fail(f"false should not confirm: {parsed}")
     ok("parse explicit false")
 
+    # Multiple/braced prose around the object must not break extraction.
+    parsed = parse_llm_response(
+        '说明 {不是JSON} 后给出 {"is_injection": false, "confidence": 0.91, "reason": "游戏语境"} 完毕'
+    )
+    if not parsed["usable"] or parsed["is_injection"]:
+        fail(f"should find the first valid JSON object: {parsed}")
+    ok("parser skips invalid braces and finds valid JSON")
+
     parsed = parse_llm_response("I am not JSON at all")
-    if parsed["is_injection"]:
-        fail(f"garbage should fail open: {parsed}")
-    ok("garbage fails open")
+    if parsed["is_injection"] or parsed["usable"]:
+        fail(f"garbage should be unusable: {parsed}")
+    if DefaultEventListener._is_hit(None, "standby", "medium", parsed):
+        fail("attempted-but-unparseable LLM review should fail open")
+    ok("unparseable attempted review fails open")
+
+    no_model = {
+        "is_injection": False,
+        "confidence": 0.0,
+        "reason": "LLM 未配置",
+        "usable": False,
+        "attempted": False,
+    }
+    if not DefaultEventListener._is_hit(None, "standby", "medium", no_model):
+        fail("when no review was attempted, medium/high rules must still block")
+    ok("no-model fallback still trusts medium/high rules")
 
     parsed = parse_llm_response('{"is_injection": true, "confidence": 0.2, "reason": "maybe"}')
     if llm_confirms_injection(parsed):
@@ -168,6 +190,97 @@ def check_llm_parser() -> None:
     if parsed["is_injection"]:
         fail("empty should fail open")
     ok("empty fails open")
+
+
+def check_review_failure_policy() -> None:
+    """A malformed semantic verdict must not block a benign keyword context."""
+    from default import DefaultEventListener
+
+    # The PTD score for this game-related phrase is medium because the literal
+    # word is also a built-in keyword. The review call was attempted, but the
+    # provider returned unusable text, so the message must pass through.
+    malformed = {
+        "is_injection": False,
+        "confidence": 0.0,
+        "reason": "LLM 返回无法解析",
+        "usable": False,
+        "attempted": True,
+    }
+    if DefaultEventListener._is_hit(None, "standby", "medium", malformed):
+        fail("malformed attempted review incorrectly blocked a medium local hit")
+    ok("malformed attempted review fails open for benign contexts")
+
+    clean = {
+        "is_injection": False,
+        "confidence": 0.95,
+        "reason": "游戏语境，不是提示词注入",
+        "usable": True,
+        "attempted": True,
+    }
+    if DefaultEventListener._is_hit(None, "standby", "medium", clean):
+        fail("usable clean verdict should clear a local medium hit")
+    ok("usable clean review clears a local medium hit")
+
+
+def check_review_audit_persistence() -> None:
+    """Passed reviews must remain inspectable even though no incident is created."""
+    import asyncio
+    import json
+
+    from default import DefaultEventListener
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "review_audit.jsonl")
+        listener = DefaultEventListener()
+        audit = {
+            "is_injection": False,
+            "confidence": 0.94,
+            "reason": "普通问题",
+            "usable": True,
+            "attempted": True,
+            "raw_response": '{"is_injection": false, "confidence": 0.94, "reason": "普通问题"}',
+        }
+        asyncio.run(
+            listener._write_review_audit(
+                {"review_audit_path": path},
+                identity={
+                    "group_id": "g1",
+                    "group_name": "测试群",
+                    "sender_id": "u1",
+                    "sender_name": "测试用户",
+                },
+                question="猫娘是什么动漫角色？",
+                analysis={"score": 9, "severity": "medium", "reason": "命中关键词"},
+                mode="standby",
+                model_uuid="model-1",
+                llm=audit,
+                action="passed",
+            )
+        )
+        with open(path, encoding="utf-8") as fh:
+            rows = [json.loads(line) for line in fh if line.strip()]
+        if len(rows) != 1 or rows[0]["action"] != "passed":
+            fail(f"passed review audit was not persisted: {rows}")
+        for key in ("question", "llm_raw", "llm_reason", "model_uuid"):
+            if not rows[0].get(key):
+                fail(f"audit record missing {key}: {rows[0]}")
+    ok("passed review is persisted to review_audit.jsonl")
+
+
+def check_bot_credentials() -> None:
+    from bot_credentials import qqofficial_credentials
+
+    found = qqofficial_credentials(
+        {"adapter": "qqofficial", "bot": {"appId": "app-1", "appSecret": "secret-1"}}
+    )
+    if found != ("app-1", "secret-1"):
+        fail(f"LangBot bot credentials should be discovered: {found}")
+    empty = qqofficial_credentials(
+        {"adapter": "wechat", "token": "not-a-qq-secret", "account": {"userid": "u1"}}
+    )
+    if empty != ("", ""):
+        fail(f"unrelated adapter credentials must not be used: {empty}")
+    ok("bot credentials are read from exposed bot info without logging them")
 
 
 def check_sdk_wiring() -> None:
@@ -767,6 +880,9 @@ def main() -> None:
     check_manifest_thresholds()
     check_rules_doc()
     check_admin_ids()
+    check_bot_credentials()
+    check_review_failure_policy()
+    check_review_audit_persistence()
     check_stderr_logging()
     if sdk_available():
         check_llm_parser()
