@@ -8,6 +8,12 @@ Chinese install notes: `readme/README_zh_Hans.md`.
 
 ## What changed in v0.1.4
 
+**Passed reviews can be DM'd to admins.** New **`notify_on_pass`** (default off):
+when the review model clears a message, the full record is still sent to the
+admins — local score/severity, LLM verdict and confidence, **raw model output**
+and the original text. Confirmed working, and currently the usable way to see
+what the reviewer said about a message that was let through.
+
 **Admin DMs now work on QQ, WeCom and WeChat** via a new
 **`admin_notify_platform`** selector (auto / QQ official / WeCom smart bot /
 WeCom internal app / personal WeChat / disabled). Verified against LangBot's own
@@ -32,13 +38,13 @@ the adapter. A plain QQ number given to a QQ official bot is likewise rejected u
 front with a message asking for the openid.
 
 Tickets now carry `notify_platform` / `notify_transport`. The offline suite runs
-63 checks, including per-platform transport routing.
+63 checks, including per-platform transport routing and the passed-review DM.
 
 ### Known issue
 
-Inspecting review records still does not work: the plugin log panel stays empty
-and `review_audit.jsonl` records nothing. This is still being investigated — do
-not rely on it.
+Two ways of inspecting review records still do not work: the plugin log panel
+stays empty and `review_audit.jsonl` records nothing. Still being investigated —
+do not rely on them. Use the `notify_on_pass` DM above instead.
 
 ## How it works
 
