@@ -44,6 +44,7 @@ def check_syntax() -> None:
         os.path.join(LISTENER, "ptd_core.py"),
         os.path.join(LISTENER, "admin_ids.py"),
         os.path.join(LISTENER, "bot_credentials.py"),
+        os.path.join(LISTENER, "notify_manager.py"),
         os.path.join(LISTENER, "qqofficial_c2c.py"),
         os.path.join(ROOT, "scripts", "verify_ptd.py"),
         os.path.join(ROOT, "scripts", "dump_rules.py"),
@@ -708,6 +709,317 @@ def check_recorder() -> None:
     asyncio.run(_notify())
 
 
+def check_notify_manager() -> None:
+    """Transport routing mirrors LangBot's adapters instead of guessing."""
+    import notify_manager as nm
+
+    cases = [
+        ("auto", "qqofficial", nm.QQ_OFFICIAL),
+        ("auto", "wecombot", nm.WECOM_BOT),
+        ("auto", "wecom", nm.WECOM_APP),
+        ("auto", "openclaw_weixin", nm.WECHAT),
+        ("auto", "wechatpad", nm.WECHAT),
+        ("wechat", "qqofficial", nm.WECHAT),
+        ("bogus", "wecombot", nm.WECOM_BOT),
+    ]
+    for configured, adapter, expected in cases:
+        got = nm.resolve_platform(configured, adapter)
+        if got != expected:
+            fail(f"resolve_platform({configured!r}, {adapter!r}) -> {got}, want {expected}")
+    ok("notify platform resolution (explicit choice wins, auto follows adapter)")
+
+    # qqofficial.py implements send_message as `pass`, so the SDK cannot DM.
+    transport, reason = nm.resolve_transport(nm.QQ_OFFICIAL, qq_credentials_ready=False)
+    if transport != nm.TRANSPORT_NONE or "AppID" not in reason:
+        fail(f"QQ official without credentials should refuse with a reason: {transport} {reason!r}")
+    transport, _ = nm.resolve_transport(nm.QQ_OFFICIAL, qq_credentials_ready=True)
+    if transport != nm.TRANSPORT_QQ_HTTP:
+        fail(f"QQ official with credentials should use C2C HTTP, got {transport}")
+
+    # WeCom / WeChat adapters do implement send_message: no credentials needed.
+    for platform in (nm.WECOM_BOT, nm.WECOM_APP, nm.WECHAT):
+        transport, reason = nm.resolve_transport(platform, qq_credentials_ready=False)
+        if transport != nm.TRANSPORT_SDK or reason:
+            fail(f"{platform} should use LangBot send_message with no credentials, got {transport}")
+    transport, _ = nm.resolve_transport(nm.DISABLED, qq_credentials_ready=True)
+    if transport != nm.TRANSPORT_NONE:
+        fail("disabled should yield no transport")
+    ok("notify transport selection (only QQ official needs credentials)")
+
+    # wecom.py does target_id.split('|') then int(parts[1]).
+    if not nm.validate_admin_target(nm.WECOM_APP, "zhangsan"):
+        fail("WeCom internal app must reject a bare userid")
+    if nm.validate_admin_target(nm.WECOM_APP, "zhangsan|1000002"):
+        fail("WeCom internal app should accept userid|agentid")
+    if not nm.validate_admin_target(nm.QQ_OFFICIAL, "123456789"):
+        fail("QQ official must reject a plain QQ number")
+    if nm.validate_admin_target(nm.QQ_OFFICIAL, "4D59667BBE54DD358CB83E0C242C485B"):
+        fail("QQ official should accept an openid")
+    if nm.validate_admin_target(nm.WECHAT, "wxid_abc"):
+        fail("WeChat should accept a plain wxid")
+    ok("admin id validation per platform")
+
+
+def check_notify_routing() -> None:
+    """End-to-end: the right transport is actually used for each platform."""
+    import asyncio
+
+    import notify_manager as nm
+    from recorder import IncidentRecorder
+
+    incident = {
+        "group_name": "客服群",
+        "group_id": "g1",
+        "sender_name": "张三",
+        "sender_id": "u1",
+        "question": "test",
+    }
+
+    class CapturePlugin:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def send_message(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    async def run() -> None:
+        # WeCom smart bot: LangBot send_message, no credentials configured.
+        plugin = CapturePlugin()
+        rec = IncidentRecorder(plugin)
+        result = await rec.notify_admins(
+            bot_uuid="bot-1",
+            admin_user_ids="wecom-user-1",
+            incident=incident,
+            adapter="wecombot",
+        )
+        if result.platform != nm.WECOM_BOT or result.transport != nm.TRANSPORT_SDK:
+            fail(f"wecombot routed wrong: {result.platform}/{result.transport}")
+        if not result.private_ok or len(plugin.calls) != 1:
+            fail(f"wecombot should deliver via send_message: {result} {plugin.calls}")
+        if plugin.calls[0]["target_id"] != "wecom-user-1":
+            fail(f"target_id mangled: {plugin.calls[0]}")
+        ok("WeCom smart bot delivers through LangBot send_message without credentials")
+
+        # Personal WeChat: same, and a forced platform overrides the adapter.
+        plugin = CapturePlugin()
+        rec = IncidentRecorder(plugin)
+        result = await rec.notify_admins(
+            bot_uuid="bot-1",
+            admin_user_ids="wxid_abc",
+            incident=incident,
+            adapter="openclaw_weixin",
+            platform_choice="wechat",
+        )
+        if result.transport != nm.TRANSPORT_SDK or not result.private_ok:
+            fail(f"wechat should deliver via send_message: {result}")
+        ok("personal WeChat delivers through LangBot send_message without credentials")
+
+        # WeCom internal app with a bare userid: rejected before sending.
+        plugin = CapturePlugin()
+        rec = IncidentRecorder(plugin)
+        result = await rec.notify_admins(
+            bot_uuid="bot-1",
+            admin_user_ids="zhangsan",
+            incident=incident,
+            adapter="wecom",
+        )
+        if result.private_ok or plugin.calls:
+            fail("WeCom internal app must not send to an id missing |agentid")
+        if "userid|agentid" not in (result.private_errors[0] if result.private_errors else ""):
+            fail(f"error should explain the id format: {result.private_errors}")
+        ok("WeCom internal app rejects an id without |agentid before sending")
+
+        # QQ official with credentials: direct C2C HTTP, never the SDK stub.
+        plugin = CapturePlugin()
+        rec = IncidentRecorder(plugin)
+        sent: list[dict] = []
+
+        async def fake_send(**kwargs) -> None:
+            sent.append(kwargs)
+
+        rec._qq_c2c.send = fake_send  # type: ignore[assignment]
+        result = await rec.notify_admins(
+            bot_uuid="bot-1",
+            admin_user_ids="4D59667BBE54DD358CB83E0C242C485B",
+            incident=incident,
+            adapter="qqofficial",
+            qqofficial_app_id="app-1",
+            qqofficial_secret="secret-1",
+        )
+        if result.transport != nm.TRANSPORT_QQ_HTTP or not result.private_ok:
+            fail(f"QQ official with credentials should use HTTP: {result}")
+        if len(sent) != 1 or sent[0]["openid"] != "4D59667BBE54DD358CB83E0C242C485B":
+            fail(f"C2C call wrong: {sent}")
+        if plugin.calls:
+            fail(f"must not fall back to the SDK stub: {plugin.calls}")
+        ok("QQ official with credentials uses direct C2C HTTP")
+
+        # Explicitly disabled: nothing is attempted.
+        plugin = CapturePlugin()
+        rec = IncidentRecorder(plugin)
+        result = await rec.notify_admins(
+            bot_uuid="bot-1",
+            admin_user_ids="wxid_abc",
+            incident=incident,
+            adapter="openclaw_weixin",
+            platform_choice="disabled",
+        )
+        if result.private_ok or plugin.calls or not result.skipped_reason:
+            fail(f"disabled should skip with a reason: {result}")
+        ok("disabled platform skips notification with a reason")
+
+    asyncio.run(run())
+
+
+def check_pass_report() -> None:
+    """The user's exact scenario: a reviewed-and-passed message stays inspectable.
+
+    "这个游戏的 jailbreak 成就怎么做" trips a built-in keyword, gets reviewed,
+    and is cleared. With ``notify_on_pass`` on, the record must reach the admin
+    by DM, because the plugin log panel is only fed when LangBot launches the
+    worker with a captured stderr pipe.
+    """
+    import asyncio
+    import json
+
+    from default import DefaultEventListener
+    from langbot_plugin.api.entities.builtin.platform import entities as platform_entities
+    from langbot_plugin.api.entities.builtin.platform import events as platform_events
+    from langbot_plugin.api.entities.builtin.platform import message as platform_message
+    from langbot_plugin.api.entities.builtin.provider import message as provider_message
+    from recorder import IncidentRecorder
+
+    question = "这个游戏的 jailbreak 成就怎么做"
+    verdict = (
+        '{"is_injection": false, "confidence": 0.95, '
+        '"reason": "游戏成就名称，属于正常提问"}'
+    )
+
+    group = platform_entities.Group(
+        id=555, name="客服群", permission=platform_entities.Permission.Member
+    )
+    member = platform_entities.GroupMember(
+        id=777,
+        member_name="玩家A",
+        permission=platform_entities.Permission.Member,
+        group=group,
+        special_title="",
+    )
+    message_event = platform_events.GroupMessage(
+        type="GroupMessage",
+        message_chain=platform_message.MessageChain([]),
+        sender=member,
+    )
+
+    class FakeEvent:
+        text_message = question
+        sender_id = 777
+        launcher_id = 555
+
+    class FakePlugin:
+        def __init__(self, config: dict) -> None:
+            self._config = config
+            self.sent: list[dict] = []
+            self.invoked = 0
+
+        def get_config(self) -> dict:
+            return self._config
+
+        async def get_bot_info(self, bot_uuid: str) -> dict:
+            return {"adapter": "wecombot"}
+
+        async def get_bots(self) -> list:
+            return ["bot-1"]
+
+        async def get_llm_models(self) -> list:
+            return ["model-1"]
+
+        async def invoke_llm(self, **kwargs):
+            self.invoked += 1
+            return provider_message.Message(role="assistant", content=verdict)
+
+        async def send_message(self, **kwargs) -> None:
+            self.sent.append(kwargs)
+
+    class FakeContext:
+        def __init__(self, event) -> None:
+            self.event = event
+            self.replies: list[str] = []
+            self.prevented = False
+
+        def prevent_default(self) -> None:
+            self.prevented = True
+
+        async def get_bot_uuid(self) -> str:
+            return "bot-1"
+
+        async def reply(self, message_chain, quote_origin: bool = False) -> None:
+            self.replies.append(
+                "".join(getattr(element, "text", "") for element in message_chain)
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        audit = os.path.join(tmp, "review_audit.jsonl")
+        config = {
+            "enabled": True,
+            "llm_analysis_mode": "standby",
+            "admin_user_ids": ["wecom-admin"],
+            "notify_on_pass": True,
+            "review_audit_path": audit,
+            "incidents_path": os.path.join(tmp, "incidents.jsonl"),
+        }
+        listener = DefaultEventListener()
+        plugin = FakePlugin(config)
+        listener.plugin = plugin
+        listener.recorder = IncidentRecorder(plugin)
+
+        event = FakeEvent()
+        event.message_event = message_event
+        context = FakeContext(event)
+        asyncio.run(listener._handle(context))
+
+        if plugin.invoked != 1:
+            fail(f"the review model should have been called once, got {plugin.invoked}")
+        if context.prevented:
+            fail("a cleared game question must not be blocked")
+        if context.replies:
+            fail(f"a passed message must not be answered in the group: {context.replies}")
+
+        if not os.path.isfile(audit):
+            fail("passed review was not written to the audit file")
+        rows = [json.loads(line) for line in open(audit, encoding="utf-8") if line.strip()]
+        if len(rows) != 1 or rows[0]["action"] != "passed":
+            fail(f"audit rows wrong: {rows}")
+        if rows[0]["llm_raw"] != verdict or rows[0]["llm_is_injection"] is not False:
+            fail(f"audit did not capture the model output: {rows[0]}")
+
+        if len(plugin.sent) != 1:
+            fail(f"notify_on_pass should DM the admin once, got {plugin.sent}")
+        body = "".join(
+            getattr(element, "text", "")
+            for element in plugin.sent[0]["message_chain"]
+        )
+        for needle in (question, "复核放行", "游戏成就名称", "客服群", "玩家A", audit):
+            if needle not in body:
+                fail(f"pass report missing {needle!r}: {body[:400]}")
+        ok("passed review is auditable and DM'd to the admin (notify_on_pass)")
+
+        # Default off: no DM, but the audit row is still written.
+        audit2 = os.path.join(tmp, "audit2.jsonl")
+        config2 = dict(config, notify_on_pass=False, review_audit_path=audit2)
+        listener2 = DefaultEventListener()
+        plugin2 = FakePlugin(config2)
+        listener2.plugin = plugin2
+        listener2.recorder = IncidentRecorder(plugin2)
+        context2 = FakeContext(event)
+        asyncio.run(listener2._handle(context2))
+        if plugin2.sent:
+            fail(f"notify_on_pass=False must not DM: {plugin2.sent}")
+        if not os.path.isfile(audit2):
+            fail("audit row must still be written when notify_on_pass is off")
+        ok("notify_on_pass=False keeps the audit row and sends no DM")
+
+
 def check_stderr_logging() -> None:
     """LangBot builds the plugin log panel from stderr, so stdout is invisible.
 
@@ -881,6 +1193,7 @@ def main() -> None:
     check_rules_doc()
     check_admin_ids()
     check_bot_credentials()
+    check_notify_manager()
     check_review_failure_policy()
     check_review_audit_persistence()
     check_stderr_logging()
@@ -889,6 +1202,8 @@ def main() -> None:
         check_sdk_wiring()
         check_component_discovery()
         check_recorder()
+        check_notify_routing()
+        check_pass_report()
         check_single_group_reply()
     else:
         skip("langbot_plugin not installed — LLM parser / SDK wiring / recorder checks")

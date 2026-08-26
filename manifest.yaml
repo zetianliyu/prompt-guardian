@@ -4,7 +4,7 @@ metadata:
   author: dxzk
   name: PromptGuardian
   repository: 'https://github.com/zetianliyu/prompt-guardian'
-  version: 0.1.3
+  version: 0.1.4
   description:
     en_US: Rule-based plus LLM-reviewed prompt-injection guard. Blocks jailbreaks in group chats and files a ticket (group, user, question) for human follow-up.
     zh_Hans: 规则预筛 + LLM 复核的提示词注入防护。拦截群聊越狱，并记录「哪个群、哪个用户、问了什么」供人工客服处理。
@@ -106,6 +106,42 @@ spec:
             en_US: Group only
             zh_Hans: 仅群内通知
 
+    - name: admin_notify_platform
+      type: select
+      label:
+        en_US: Admin DM platform
+        zh_Hans: 私聊所用平台
+      description:
+        en_US: "Which transport delivers the admin DM. `auto` derives it from the selected bot's adapter. WeCom / WeChat need NO credentials here — LangBot's adapters already implement send_message, so picking the bot is enough. Only QQ official needs AppID/AppSecret, because its adapter's send_message is an upstream stub."
+        zh_Hans: "用哪条链路给管理员发私聊。`auto` 按所选机器人的适配器自动判断。企业微信 / 微信**不需要**在这里填任何凭据——LangBot 的适配器已实现 send_message，选好机器人即可。只有 QQ 官方机器人需要 AppID/AppSecret，因为上游适配器的 send_message 是空实现。"
+      default: auto
+      required: false
+      options:
+        - name: auto
+          label:
+            en_US: Auto (from selected bot)
+            zh_Hans: 自动（按所选机器人）
+        - name: qq_official
+          label:
+            en_US: QQ official bot (needs AppID/Secret)
+            zh_Hans: QQ 官方机器人（需 AppID/Secret）
+        - name: wecom_bot
+          label:
+            en_US: WeCom smart bot (no credentials)
+            zh_Hans: 企业微信智能机器人（免凭据）
+        - name: wecom_app
+          label:
+            en_US: WeCom internal app (id = userid|agentid)
+            zh_Hans: 企业微信内部应用（ID 填 userid|agentid）
+        - name: wechat
+          label:
+            en_US: Personal WeChat (no credentials)
+            zh_Hans: 微信个人机器人（免凭据）
+        - name: disabled
+          label:
+            en_US: Disabled (no DM)
+            zh_Hans: 关闭私聊通知
+
     - name: qqofficial_app_id
       type: string
       label:
@@ -116,6 +152,12 @@ spec:
         zh_Hans: "QQ 官方机器人：如果 LangBot 宿主暴露了凭据，插件会从所选 bot 信息读取 AppID 和 AppSecret；否则请手动填写以使用 C2C HTTP。不要把微信/企微 token 填在这里。"
       default: ''
       required: false
+      show_if:
+        field: admin_notify_platform
+        operator: in
+        value:
+          - auto
+          - qq_official
 
     - name: qqofficial_secret
       type: string
@@ -127,6 +169,12 @@ spec:
         zh_Hans: "仅用于换取 access_token 以主动私聊。如果所选 LangBot bot 暴露了 AppSecret，则优先使用宿主提供的值；此项是兼容旧版宿主的手动回退。不会送给复核 LLM。"
       default: ''
       required: false
+      show_if:
+        field: admin_notify_platform
+        operator: in
+        value:
+          - auto
+          - qq_official
 
     - name: qqofficial_sandbox
       type: boolean
@@ -138,6 +186,12 @@ spec:
         zh_Hans: 走 sandbox.api.sgroup.qq.com 而不是正式环境。
       default: false
       required: false
+      show_if:
+        field: admin_notify_platform
+        operator: in
+        value:
+          - auto
+          - qq_official
 
     - name: qqofficial_trust_send_message
       type: boolean
@@ -149,6 +203,12 @@ spec:
         zh_Hans: 默认关闭。LangBot 的 qqofficial 适配器目前 send_message 是空实现。只有上游真正能发 C2C 之后才打开。
       default: false
       required: false
+      show_if:
+        field: admin_notify_platform
+        operator: in
+        value:
+          - auto
+          - qq_official
 
     - name: whitelist_user_ids
       type: array[string]
@@ -194,14 +254,40 @@ spec:
       default: incidents.jsonl
       required: false
 
+    - name: notify_on_pass
+      type: boolean
+      label:
+        en_US: DM admins for passed reviews too
+        zh_Hans: 复核放行也私聊管理员
+      description:
+        en_US: "Send the full review record (local score, LLM verdict, raw model output, original text) to admins even when the message is allowed through. Turn this on to inspect passed reviews: LangBot only fills its plugin log panel when the worker is launched with a captured stderr pipe, which the normal production path does not do, so a DM is the reliable channel. Noisy in `active` mode."
+        zh_Hans: "即使消息被复核放行，也把完整复核记录（本地分数、LLM 结论、模型原始返回、原文）私聊给管理员。想查看放行的复核结果就打开它：LangBot 只有在以捕获 stderr 的方式启动插件进程时才会填充插件日志面板，而正式部署路径并不这样做，所以私聊是可靠渠道。`active` 模式下会比较吵。"
+      default: false
+      required: false
+
+    - name: notify_on_pass_group_fallback
+      type: boolean
+      label:
+        en_US: Post passed-review record in group if DM fails
+        zh_Hans: 放行记录私聊失败时在群内补发
+      description:
+        en_US: "Only used when the option above is on. Posts the passed-review record into the originating group when the DM could not be delivered. Visible to everyone in that group — leave off unless the group is staff-only."
+        zh_Hans: "仅在上一项开启时生效。私聊送不出去时，把放行记录发到消息来源群。群内所有人可见——除非该群只有工作人员，否则请保持关闭。"
+      default: false
+      required: false
+      show_if:
+        field: notify_on_pass
+        operator: eq
+        value: true
+
     - name: review_audit_path
       type: string
       label:
         en_US: Review audit path
         zh_Hans: 复核审计文件路径
       description:
-        en_US: JSONL path for every message actually sent to the review LLM, including passed verdicts. Relative to the plugin directory or absolute.
-        zh_Hans: 记录每次实际送入复核 LLM 的消息（包括复核后放行）的 JSONL 路径。相对插件目录，也可填绝对路径。
+        en_US: "JSONL path for every message actually sent to the review LLM, including passed verdicts. A relative path resolves inside the extracted plugin directory, which under Docker lives inside the container — set an absolute path under a mounted volume to read it from the host."
+        zh_Hans: "记录每次实际送入复核 LLM 的消息（包括复核后放行）的 JSONL 路径。相对路径落在插件解压目录下；Docker 部署时那是容器内部路径，想在宿主机直接查看请填一个挂载卷下的绝对路径。"
       default: review_audit.jsonl
       required: false
 

@@ -8,6 +8,52 @@ LangBot 4.x 插件。用 **规则预筛 + LLM 复核** 识别群聊里的提示�
 
 这不是 AstrBot 插件。规则库（PTD 4.1.0）来自 [oyxning/astrbot_plugin_antipromptinjector](https://github.com/oyxning/astrbot_plugin_antipromptinjector)。关键词 / 权重 / 阈值均未改动；有 3 条正则做了修复——上游用了 JS 风格的 `\u{XXXX}` 转义，Python `re` 不接受，会让检测器连构造都失败。详见仓库根目录 `NOTICE`、`LICENSE`，整体按 AGPL-3.0 发布。
 
+## v0.1.4 更新内容
+
+### 1. 复核记录终于看得到了（含放行的那些）
+
+先说清一件事，这是之前两版没解决的**根本原因**：
+
+LangBot 的插件日志面板只在**以捕获 stderr 的方式启动插件进程时**才有内容。看 SDK 源码 `runtime/plugin/worker_launcher.py` 的 `create_controller()`，它构造 `StdioClientController` 时**从来没有传 `capture_stderr=True`**，而该参数默认是 `False`；于是 `stderr=None`，子进程 stderr 直接继承宿主，`process.stderr` 是 `None`。而 `runtime/io/handlers/plugin.py` 里：
+
+```python
+self.log_buffer = PluginLogBuffer()
+if self.stdio_process is not None and self.stdio_process.stderr is not None:
+    self.log_buffer.start_reader(self.stdio_process.stderr)
+```
+
+读取任务因此**永远不会启动**，环形缓冲区一直是空的，`get_plugin_logs` 返回 `[]`。也就是说：**在正式部署路径下，插件写什么日志都不会出现在那个面板里**——这是上游 LangBot 的限制，不是本插件能修的。v0.1.2 把 `print` 改成 stderr logging 是必要的（格式现在对了，`lbp run` 调试时能看到），但**不足以**让面板出现内容。
+
+所以这版改成用**能验证的渠道**送出复核记录：
+
+- 新增 **复核放行也私聊管理员**（`notify_on_pass`，默认关）。打开后，即使消息被复核放行，也把完整记录私聊给管理员：本地分数/级别、LLM 结论与置信度、**模型原始返回**、原文、审计文件路径。这正是「猫娘是什么动漫角色？」这类测试之前无论如何都看不到的那段内容。
+- 审计文件写入成功/失败都会**带着解析后的绝对路径**记录，失败原因也会跟着私聊报告一起发出来——不再只写进那个看不见的日志。
+- 复核审计文件路径的说明补上了关键一句：相对路径落在插件**解压目录**下，Docker 部署时那是**容器内部**路径。想在宿主机直接看，请填挂载卷下的绝对路径，例如 `/app/data/prompt-guardian/review_audit.jsonl`。这很可能就是你之前在插件目录里找不到 `review_audit.jsonl` 的原因。
+
+### 2. 管理员私聊支持 QQ / 企业微信 / 微信
+
+新增 **私聊所用平台**（`admin_notify_platform`）选择项：自动 / QQ 官方机器人 / 企业微信智能机器人 / 企业微信内部应用 / 微信个人机器人 / 关闭。选 `自动` 时按「通知所用机器人」的适配器判断。
+
+这里有一点和你的设想不同，我按 LangBot 适配器源码逐个核对后做了调整——**企业微信和微信不需要你填任何凭据**：
+
+| 平台 | LangBot 适配器 `send_message` | 插件需要凭据吗 |
+|---|---|---|
+| 企业微信智能机器人 `wecombot` | 已实现（WS 模式；开了 `enable-webhook` 则是空实现） | **不需要**，选好机器人即可 |
+| 企业微信内部应用 `wecom` | 已实现 | **不需要**，但管理员 ID 必须写成 `userid\|agentid` |
+| 微信个人机器人 `openclaw_weixin` / `wechatpad` | 已实现 | **不需要** |
+| QQ 官方机器人 `qqofficial` | **空实现（`pass`）** | **需要** AppID + AppSecret，走 HTTP C2C |
+| QQ OneBot `aiocqhttp` | 已实现 | 不需要 |
+
+也就是说，只有 QQ 官方那一家因为上游适配器是空壳才需要凭据；给企微/微信再加一套 BotId、密钥、令牌输入框，等于把 LangBot 已经持有的机密在插件里抄一遍，既没用又多一处泄露面，所以没有加。QQ 的那几个凭据字段现在用 `show_if` 收起来了，只在平台选 `自动` 或 `QQ 官方机器人` 时才显示。
+
+企业微信内部应用的 ID 格式是硬性要求：LangBot 的 `wecom.py` 里是 `parts = target_id.split('|')` 再 `int(parts[1])`，只填 userid 会直接抛异常。插件现在**发送前就校验**并给出可读的报错，而不是让它在适配器里崩掉。
+
+### 3. 其它
+
+- QQ 官方机器人的管理员 ID 若填成纯数字（QQ 号），发送前就会被拦下并提示需要 openid。
+- 病单里新增 `notify_platform` / `notify_transport`，能看出这次实际走了哪条链路。
+- 自检共 63 项，新增覆盖：各平台链路选择、企微 ID 格式校验、QQ 有凭据时不回落到空实现、放行记录可审计且能私聊送达。
+
 ## 流水线
 
 ```
@@ -48,6 +94,9 @@ LLM 必须同时给出 `is_injection=true` 且 `confidence >= 0.6` 才算确认�
 |---|---|---|
 | QQ OneBot / NapCat / Lagrange | QQ 号 | 能（走 `send_message` `person`） |
 | QQ 官方机器人（会话类型是 `C2C_MESSAGE_CREATE`） | **只要** `person` 后面那串 openid，例如 `4D59667BBE54DD358CB83E0C242C485B` | LangBot 官方适配器的 `send_message` 是空实现。必须再填本插件的 AppID + AppSecret，才会用 QQ HTTP 主动私聊。不填则在**本群补发**病单 |
+| 企业微信智能机器人 | 该平台的用户标识 | 能，**无需任何凭据**（适配器需在 WS 模式，即 `enable-webhook` 关闭） |
+| 企业微信内部应用 | `userid\|agentid`，例如 `zhangsan\|1000002` | 能，**无需任何凭据**；ID 少写 `\|agentid` 会被插件挡下并提示 |
+| 微信个人机器人（OpenClaw / WeChatPad） | wxid | 能，**无需任何凭据** |
 
 **不要**整段粘贴：
 
@@ -77,13 +126,17 @@ QQ 官方主动私聊还要求：管理员曾经私聊过这个机器人，并�
 | 管理员用户 ID | 空 | 收病单的对象，见上一节 |
 | 通知所用机器人 | 空 | 空则用当前收到群消息的 bot |
 | 管理员通知方式 | 先私聊，失败则群内补发 | private / private_then_group / group |
-| QQ 官方机器人 AppID | 空 | 官方机器人要真正私聊时必填 |
+| 私聊所用平台 | 自动 | 自动 / QQ 官方 / 企微智能机器人 / 企微内部应用 / 微信 / 关闭 |
+| QQ 官方机器人 AppID | 空 | 仅 QQ 官方需要；平台选企微/微信时会自动隐藏 |
 | QQ 官方机器人 AppSecret | 空 | 仅用于换 token，不送给 LLM |
 | 使用 QQ 官方沙箱 API | 关 | 沙箱 bot 打开 |
 | 白名单用户 ID | 空 | 跳过检测 |
 | 拦截时在群里回复 | 开 | 是否在群里回拒绝文案 |
 | 群内拒绝文案 | ⚠️ 检测到提示词注入风险… | 可改 |
 | 病单文件路径 | `incidents.jsonl` | 相对插件目录，也可填绝对路径 |
+| 复核放行也私聊管理员 | 关 | 打开后放行的复核记录也私聊发出，见上文 |
+| 放行记录私聊失败时群内补发 | 关 | 群内所有人可见，非工作人员群请勿开 |
+| 复核审计文件路径 | `review_audit.jsonl` | Docker 下相对路径在容器内，建议填挂载卷绝对路径 |
 | medium 判定阈值 | 7 | 达到多少分算 medium |
 | high 判定阈值 | 11 | 达到多少分算 high |
 | 自定义关键词 | 空 | 每行 `关键词:权重` |

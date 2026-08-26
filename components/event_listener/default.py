@@ -315,8 +315,13 @@ class DefaultEventListener(EventListener):
         model_uuid: str,
         llm: dict[str, Any] | None,
         action: str,
-    ) -> None:
-        """Persist semantic-review outcomes, including messages that pass."""
+    ) -> tuple[str, str]:
+        """Persist a review outcome. Returns ``(resolved_path, error)``.
+
+        The caller surfaces the error, because LangBot only feeds its plugin log
+        panel when the worker is launched with a captured stderr pipe — see the
+        README note — so an invisible log line is not a usable failure channel.
+        """
         path_value = _safe_str(cfg.get("review_audit_path"), "review_audit.jsonl")
         if os.path.isabs(path_value):
             path = path_value
@@ -352,7 +357,92 @@ class DefaultEventListener(EventListener):
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                 fh.flush()
         except Exception as exc:
-            log.error(f"write review audit failed: {exc}")
+            error = f"{type(exc).__name__}: {exc}"
+            log.error(f"write review audit to {path} failed: {error}")
+            return path, error
+        log.info(f"review audit ({action}) appended to {path}")
+        return path, ""
+
+    def _review_report_text(
+        self,
+        *,
+        identity: dict[str, str],
+        question: str,
+        analysis: dict[str, Any],
+        llm: dict[str, Any] | None,
+        action: str,
+        audit_path: str,
+        audit_error: str,
+    ) -> str:
+        llm = llm or {}
+        verdict = "拦截" if action == "blocked" else "复核放行"
+        lines = [
+            f"【PromptGuardian 复核记录 · {verdict}】",
+            f"群: {identity.get('group_name')}（{identity.get('group_id')}）",
+            f"用户: {identity.get('sender_name')}（{identity.get('sender_id')}）",
+            f"规则: severity={analysis.get('severity')} score={analysis.get('score')}",
+            f"规则原因: {analysis.get('reason') or '-'}",
+            f"LLM: is_injection={llm.get('is_injection')} confidence={llm.get('confidence')}",
+            f"LLM 原因: {llm.get('reason') or '-'}",
+            f"LLM 原始返回: {_clip(llm.get('raw_response'), 600) or '-'}",
+            "原文:",
+            _clip(question, 800),
+            f"审计文件: {audit_path}" + (f"（写入失败: {audit_error}）" if audit_error else ""),
+        ]
+        return "\n".join(lines)
+
+    async def _report_passed_review(
+        self,
+        event_context: context.EventContext,
+        cfg: dict[str, Any],
+        *,
+        identity: dict[str, str],
+        question: str,
+        analysis: dict[str, Any],
+        llm: dict[str, Any] | None,
+        audit_path: str,
+        audit_error: str,
+    ) -> None:
+        """Push a passed-review record to the admin.
+
+        This exists because the plugin log panel is fed only when LangBot
+        launches the worker with a captured stderr pipe, which the normal
+        production path does not do. A DM is the one channel we can verify.
+        """
+        report = self._review_report_text(
+            identity=identity,
+            question=question,
+            analysis=analysis,
+            llm=llm,
+            action="passed",
+            audit_path=audit_path,
+            audit_error=audit_error,
+        )
+        notify_bot = await self._resolve_notify_bot(event_context, cfg)
+        bot_info = await self._bot_info(notify_bot)
+        adapter = adapter_from_bot_info(bot_info) or "unknown"
+        auto_app_id, auto_secret = qqofficial_credentials(bot_info)
+        try:
+            notify = await self.recorder.notify_admins(
+                bot_uuid=notify_bot,
+                admin_user_ids=cfg.get("admin_user_ids") or [],
+                incident={},
+                adapter=adapter,
+                platform_choice=_safe_str(cfg.get("admin_notify_platform"), "auto"),
+                text=report,
+                qqofficial_app_id=auto_app_id or _safe_str(cfg.get("qqofficial_app_id"), ""),
+                qqofficial_secret=auto_secret or _safe_str(cfg.get("qqofficial_secret"), ""),
+                qqofficial_sandbox=bool(cfg.get("qqofficial_sandbox", False)),
+                trust_qqofficial_send_message=bool(cfg.get("qqofficial_trust_send_message", False)),
+            )
+        except Exception as exc:
+            log.error(f"passed-review report failed: {exc}")
+            return
+        if not notify.private_ok and cfg.get("notify_on_pass_group_fallback", False):
+            reason = notify.skipped_reason or (
+                notify.private_errors[0] if notify.private_errors else ""
+            )
+            await self._reply(event_context, f"{report}\n未能私聊送达: {reason or '未知原因'}")
 
     async def _reply(self, event_context: context.EventContext, text: str) -> None:
         try:
@@ -446,7 +536,7 @@ class DefaultEventListener(EventListener):
                     "review decision: action=passed question=%r reason=%r"
                     % (_clip(text), _clip((llm_result or {}).get("reason") or analysis.get("reason"), 500))
                 )
-                await self._write_review_audit(
+                audit_path, audit_error = await self._write_review_audit(
                     cfg,
                     identity=identity,
                     question=text,
@@ -456,15 +546,27 @@ class DefaultEventListener(EventListener):
                     llm=llm_result,
                     action="passed",
                 )
+                if cfg.get("notify_on_pass", False):
+                    await self._report_passed_review(
+                        event_context,
+                        cfg,
+                        identity=identity,
+                        question=text,
+                        analysis=analysis,
+                        llm=llm_result,
+                        audit_path=audit_path,
+                        audit_error=audit_error,
+                    )
             return
 
         event_context.prevent_default()
+        audit_path, audit_error = "", ""
         if review_attempted:
             log.info(
                 "review decision: action=blocked question=%r reason=%r"
                 % (_clip(text), _clip((llm_result or {}).get("reason") or analysis.get("reason"), 500))
             )
-            await self._write_review_audit(
+            audit_path, audit_error = await self._write_review_audit(
                 cfg,
                 identity=identity,
                 question=text,
@@ -483,11 +585,13 @@ class DefaultEventListener(EventListener):
         configured_secret = _safe_str(cfg.get("qqofficial_secret"), "")
         qq_app_id = auto_app_id or configured_app_id
         qq_secret = auto_secret or configured_secret
+        platform_choice = _safe_str(cfg.get("admin_notify_platform"), "auto")
         log.info(
-            "bot resolved: adapter=%s bot=%s qq_credentials=%s source=%s"
+            "bot resolved: adapter=%s bot=%s platform_choice=%s qq_credentials=%s source=%s"
             % (
                 platform,
                 notify_bot or "-",
+                platform_choice,
                 bool(qq_app_id and qq_secret),
                 "langbot" if auto_app_id and auto_secret else "plugin_config" if qq_app_id and qq_secret else "none",
             )
@@ -511,6 +615,7 @@ class DefaultEventListener(EventListener):
             admin_user_ids=cfg.get("admin_user_ids") or [],
             incident=incident,
             adapter=platform,
+            platform_choice=platform_choice,
             qqofficial_app_id=qq_app_id,
             qqofficial_secret=qq_secret,
             qqofficial_sandbox=bool(cfg.get("qqofficial_sandbox", False)),

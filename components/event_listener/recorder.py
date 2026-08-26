@@ -11,6 +11,14 @@ from plugin_log import log
 from langbot_plugin.api.entities.builtin.platform import message as platform_message
 
 from admin_ids import coerce_admin_ids, is_qqofficial_adapter
+from notify_manager import (
+    TRANSPORT_NONE,
+    TRANSPORT_QQ_HTTP,
+    TRANSPORT_SDK,
+    resolve_platform,
+    resolve_transport,
+    validate_admin_target,
+)
 from qqofficial_c2c import QQOfficialC2CSender
 
 CST = timezone(timedelta(hours=8))
@@ -33,6 +41,8 @@ class NotifyResult:
     admin_ids: list[str] = field(default_factory=list)
     bot_uuid: str = ""
     adapter: str = ""
+    platform: str = ""
+    transport: str = ""
     private_delivered: list[str] = field(default_factory=list)
     private_errors: list[str] = field(default_factory=list)
     skipped_reason: str = ""
@@ -158,6 +168,8 @@ class IncidentRecorder:
         admin_user_ids: Any,
         incident: dict[str, Any],
         adapter: str = "",
+        platform_choice: str = "auto",
+        text: str = "",
         qqofficial_app_id: str = "",
         qqofficial_secret: str = "",
         qqofficial_sandbox: bool = False,
@@ -168,70 +180,72 @@ class IncidentRecorder:
             bot_uuid=_safe_str(bot_uuid),
             adapter=_safe_str(adapter, "unknown"),
         )
+        result.platform = resolve_platform(platform_choice, result.adapter)
+        qq_ready = bool(qqofficial_app_id) and bool(qqofficial_secret)
+        result.transport, transport_reason = resolve_transport(
+            result.platform,
+            qq_credentials_ready=qq_ready,
+            trust_qqofficial_send_message=trust_qqofficial_send_message,
+        )
+
         if not result.admin_ids:
             result.skipped_reason = (
                 "管理员用户 ID 为空或无法解析。"
-                "请在插件配置里填写会话监控里 person 后面那串 openid，"
-                "不要填流水线「管理员」开关，也不要整段粘贴 C2C_MESSAGE_CREATE。"
+                "请在插件配置里填写对应平台的账号标识："
+                "QQ 官方填 openid，企业微信内部应用填 userid|agentid，"
+                "企微智能机器人 / 微信填该平台的用户标识。"
             )
             log.warning(f"skip private notify: {result.skipped_reason}")
             return result
-        if not result.bot_uuid:
-            result.skipped_reason = "bot_uuid 为空，无法主动发私聊。"
+        if result.transport == TRANSPORT_NONE:
+            result.skipped_reason = transport_reason
+            log.warning(
+                f"skip private notify: platform={result.platform} {transport_reason}"
+            )
+            return result
+        if result.transport == TRANSPORT_SDK and not result.bot_uuid:
+            result.skipped_reason = "bot_uuid 为空，无法通过 LangBot 发私聊。"
             log.warning(f"skip private notify: {result.skipped_reason}")
             return result
 
         log.info(
-            f"notifying admins={result.admin_ids} "
-            f"adapter={result.adapter} bot={result.bot_uuid}"
+            f"notifying admins={result.admin_ids} adapter={result.adapter} "
+            f"platform={result.platform} transport={result.transport} "
+            f"bot={result.bot_uuid or '-'}"
         )
-        text = self.format_admin_message(incident)
-        chain = platform_message.MessageChain([platform_message.Plain(text=text)])
-        official = is_qqofficial_adapter(result.adapter)
-        http_ready = official and bool(qqofficial_app_id) and bool(qqofficial_secret)
+        body = text or self.format_admin_message(incident)
+        chain = platform_message.MessageChain([platform_message.Plain(text=body)])
 
         for uid in result.admin_ids:
-            delivered = False
-            errors: list[str] = []
+            invalid = validate_admin_target(result.platform, uid)
+            if invalid:
+                result.private_errors.append(f"{uid}: {invalid}")
+                log.warning(f"admin id rejected: {invalid}")
+                continue
 
-            if http_ready:
-                try:
+            try:
+                if result.transport == TRANSPORT_QQ_HTTP:
                     await self._qq_c2c.send(
                         app_id=qqofficial_app_id,
                         secret=qqofficial_secret,
                         openid=uid,
-                        content=text,
+                        content=body,
                         sandbox=qqofficial_sandbox,
                     )
-                    delivered = True
-                    log.info(f"QQ official C2C delivered to {uid}")
-                except Exception as exc:
-                    errors.append(f"qq-http:{exc}")
-                    log.error(f"QQ official C2C to {uid} failed: {exc}")
-
-            sdk_usable = (not official) or trust_qqofficial_send_message or not delivered
-            if sdk_usable and not delivered:
-                if official and not trust_qqofficial_send_message:
-                    errors.append(
-                        "qqofficial 适配器的 send_message 是空实现，"
-                        "未配置 AppID/Secret 时无法主动私聊"
-                    )
                 else:
-                    try:
-                        await self._send_via_sdk(
-                            bot_uuid=result.bot_uuid,
-                            adapter=result.adapter,
-                            uid=uid,
-                            chain=chain,
-                        )
-                        delivered = True
-                    except Exception as exc:
-                        errors.append(f"sdk:{exc}")
+                    await self._send_via_sdk(
+                        bot_uuid=result.bot_uuid,
+                        adapter=result.adapter,
+                        uid=uid,
+                        chain=chain,
+                    )
+            except Exception as exc:
+                result.private_errors.append(f"{uid}: {result.transport}:{exc}")
+                log.error(f"admin notify to {uid} via {result.transport} failed: {exc}")
+                continue
 
-            if delivered:
-                result.private_delivered.append(uid)
-            else:
-                result.private_errors.append(f"{uid}: {'; '.join(errors) or 'unknown'}")
+            result.private_delivered.append(uid)
+            log.info(f"admin notify delivered to {uid} via {result.transport}")
 
         return result
 
@@ -243,6 +257,7 @@ class IncidentRecorder:
         admin_user_ids: Any,
         incident: dict[str, Any],
         adapter: str = "",
+        platform_choice: str = "auto",
         qqofficial_app_id: str = "",
         qqofficial_secret: str = "",
         qqofficial_sandbox: bool = False,
@@ -255,6 +270,7 @@ class IncidentRecorder:
                 admin_user_ids=admin_user_ids,
                 incident=incident,
                 adapter=adapter,
+                platform_choice=platform_choice,
                 qqofficial_app_id=qqofficial_app_id,
                 qqofficial_secret=qqofficial_secret,
                 qqofficial_sandbox=qqofficial_sandbox,
@@ -266,11 +282,14 @@ class IncidentRecorder:
 
         ticket = dict(incident)
         ticket["notify_admin_ids"] = notify.admin_ids
+        ticket["notify_platform"] = notify.platform
+        ticket["notify_transport"] = notify.transport
         ticket["notify_private_delivered"] = notify.private_delivered
         ticket["notify_private_errors"] = notify.private_errors
         ticket["notify_skipped"] = notify.skipped_reason
         try:
-            await self.append_jsonl(incidents_path, ticket)
+            path = await self.append_jsonl(incidents_path, ticket)
+            log.info(f"incident ticket written to {path}")
         except Exception as exc:
             log.error(f"write incident jsonl failed: {exc}")
         return notify

@@ -6,6 +6,54 @@ This is **not** an AstrBot plugin. The detection rule library (PTD 4.1.0) comes 
 
 Chinese install notes: `readme/README_zh_Hans.md`.
 
+## What changed in v0.1.4
+
+**Review records are finally reachable — including the ones that pass.** The
+root cause of the previous two attempts: LangBot fills its plugin log panel only
+when the worker is launched with a captured stderr pipe.
+`runtime/plugin/worker_launcher.py` builds `StdioClientController` without ever
+passing `capture_stderr=True` (it defaults to `False`), so `process.stderr` is
+`None` and `PluginConnectionHandler` never calls `log_buffer.start_reader(...)`.
+The ring buffer stays empty and `get_plugin_logs` returns `[]`. **Nothing a
+plugin logs can appear in that panel on the normal production path** — an
+upstream limitation this plugin cannot fix. So v0.1.4 routes review records
+through channels that can be verified:
+
+- New **`notify_on_pass`** (default off): DM the admin the full review record
+  even when the message is allowed through — local score/severity, LLM verdict
+  and confidence, **raw model output**, original text, audit path.
+- Audit writes now report the resolved absolute path, and a write failure is
+  carried into the DM instead of only into an invisible log line.
+- `review_audit_path` documents that a relative path resolves inside the
+  extracted plugin directory, which under Docker is inside the container. Use an
+  absolute path under a mounted volume to read it from the host.
+
+**Admin DMs now work on QQ, WeCom and WeChat** via a new
+**`admin_notify_platform`** selector (auto / QQ official / WeCom smart bot /
+WeCom internal app / personal WeChat / disabled). Verified against LangBot's own
+adapters — only QQ official needs credentials:
+
+| Platform | LangBot adapter `send_message` | Plugin credentials |
+|---|---|---|
+| WeCom smart bot `wecombot` | implemented (WS mode; a stub when `enable-webhook` is on) | **none** |
+| WeCom internal app `wecom` | implemented | **none**, but the admin id must be `userid\|agentid` |
+| Personal WeChat `openclaw_weixin` / `wechatpad` | implemented | **none** |
+| QQ official `qqofficial` | **stub (`pass`)** | AppID + AppSecret, for direct C2C HTTP |
+| QQ OneBot `aiocqhttp` | implemented | none |
+
+Adding BotId/secret/token fields for WeCom and WeChat would duplicate secrets
+LangBot already holds and widen the exposure surface for no gain, so they were
+deliberately left out. The QQ credential fields are now `show_if`-gated and only
+appear for `auto` / `qq_official`.
+
+WeCom internal-app ids are validated before sending, because `wecom.py` does
+`target_id.split('|')` then `int(parts[1])` — a bare userid would throw inside
+the adapter. A plain QQ number given to a QQ official bot is likewise rejected up
+front with a message asking for the openid.
+
+Tickets now carry `notify_platform` / `notify_transport`. The offline suite runs
+63 checks, including the passed-review path and per-platform transport routing.
+
 ## How it works
 
 ```
