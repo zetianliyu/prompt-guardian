@@ -10,27 +10,7 @@ LangBot 4.x 插件。用 **规则预筛 + LLM 复核** 识别群聊里的提示�
 
 ## v0.1.4 更新内容
 
-### 1. 复核记录终于看得到了（含放行的那些）
-
-先说清一件事，这是之前两版没解决的**根本原因**：
-
-LangBot 的插件日志面板只在**以捕获 stderr 的方式启动插件进程时**才有内容。看 SDK 源码 `runtime/plugin/worker_launcher.py` 的 `create_controller()`，它构造 `StdioClientController` 时**从来没有传 `capture_stderr=True`**，而该参数默认是 `False`；于是 `stderr=None`，子进程 stderr 直接继承宿主，`process.stderr` 是 `None`。而 `runtime/io/handlers/plugin.py` 里：
-
-```python
-self.log_buffer = PluginLogBuffer()
-if self.stdio_process is not None and self.stdio_process.stderr is not None:
-    self.log_buffer.start_reader(self.stdio_process.stderr)
-```
-
-读取任务因此**永远不会启动**，环形缓冲区一直是空的，`get_plugin_logs` 返回 `[]`。也就是说：**在正式部署路径下，插件写什么日志都不会出现在那个面板里**——这是上游 LangBot 的限制，不是本插件能修的。v0.1.2 把 `print` 改成 stderr logging 是必要的（格式现在对了，`lbp run` 调试时能看到），但**不足以**让面板出现内容。
-
-所以这版改成用**能验证的渠道**送出复核记录：
-
-- 新增 **复核放行也私聊管理员**（`notify_on_pass`，默认关）。打开后，即使消息被复核放行，也把完整记录私聊给管理员：本地分数/级别、LLM 结论与置信度、**模型原始返回**、原文、审计文件路径。这正是「猫娘是什么动漫角色？」这类测试之前无论如何都看不到的那段内容。
-- 审计文件写入成功/失败都会**带着解析后的绝对路径**记录，失败原因也会跟着私聊报告一起发出来——不再只写进那个看不见的日志。
-- 复核审计文件路径的说明补上了关键一句：相对路径落在插件**解压目录**下，Docker 部署时那是**容器内部**路径。想在宿主机直接看，请填挂载卷下的绝对路径，例如 `/app/data/prompt-guardian/review_audit.jsonl`。这很可能就是你之前在插件目录里找不到 `review_audit.jsonl` 的原因。
-
-### 2. 管理员私聊支持 QQ / 企业微信 / 微信
+### 1. 管理员私聊支持 QQ / 企业微信 / 微信
 
 新增 **私聊所用平台**（`admin_notify_platform`）选择项：自动 / QQ 官方机器人 / 企业微信智能机器人 / 企业微信内部应用 / 微信个人机器人 / 关闭。选 `自动` 时按「通知所用机器人」的适配器判断。
 
@@ -48,11 +28,15 @@ if self.stdio_process is not None and self.stdio_process.stderr is not None:
 
 企业微信内部应用的 ID 格式是硬性要求：LangBot 的 `wecom.py` 里是 `parts = target_id.split('|')` 再 `int(parts[1])`，只填 userid 会直接抛异常。插件现在**发送前就校验**并给出可读的报错，而不是让它在适配器里崩掉。
 
-### 3. 其它
+### 2. 其它
 
 - QQ 官方机器人的管理员 ID 若填成纯数字（QQ 号），发送前就会被拦下并提示需要 openid。
 - 病单里新增 `notify_platform` / `notify_transport`，能看出这次实际走了哪条链路。
-- 自检共 63 项，新增覆盖：各平台链路选择、企微 ID 格式校验、QQ 有凭据时不回落到空实现、放行记录可审计且能私聊送达。
+- 自检共 63 项，新增覆盖：各平台链路选择、企微 ID 格式校验、QQ 有凭据时不回落到空实现。
+
+### 已知问题
+
+复核记录的查看仍然不可用：插件日志面板没有内容，`review_audit.jsonl` 也没有记录。相关功能仍在排查中，请勿依赖。
 
 ## 流水线
 
