@@ -1,0 +1,258 @@
+apiVersion: v1
+kind: Plugin
+metadata:
+  author: dxzk
+  name: PromptGuardian
+  repository: 'https://github.com/zetianliyu/prompt-guardian'
+  version: 0.1.2
+  description:
+    en_US: Rule-based plus LLM-reviewed prompt-injection guard. Blocks jailbreaks in group chats and files a ticket (group, user, question) for human follow-up.
+    zh_Hans: 规则预筛 + LLM 复核的提示词注入防护。拦截群聊越狱，并记录「哪个群、哪个用户、问了什么」供人工客服处理。
+  label:
+    en_US: Prompt Guardian
+    zh_Hans: 提示词注入防护
+  icon: assets/icon.svg
+spec:
+  config:
+    - name: enabled
+      type: boolean
+      label:
+        en_US: Enable
+        zh_Hans: 启用插件
+      description:
+        en_US: Master switch for prompt-injection detection.
+        zh_Hans: 提示词注入检测总开关。
+      default: true
+      required: false
+
+    - name: llm_analysis_mode
+      type: select
+      label:
+        en_US: LLM review mode
+        zh_Hans: LLM 复核模式
+      description:
+        en_US: "standby: review only when rules flag a risk. active: review every group message. disabled: rules only (block on medium/high)."
+        zh_Hans: "standby：规则非 none 才复核。active：每条群消息都复核。disabled：只靠规则，medium/high 直接拦截。"
+      default: standby
+      required: false
+      options:
+        - name: standby
+          label:
+            en_US: Standby (rules first)
+            zh_Hans: 待机（规则预筛）
+        - name: active
+          label:
+            en_US: Active (every message)
+            zh_Hans: 活跃（每条复核）
+        - name: disabled
+          label:
+            en_US: Disabled (rules only)
+            zh_Hans: 禁用（仅规则）
+
+    - name: review_llm_model
+      type: llm-model-selector
+      label:
+        en_US: Review LLM
+        zh_Hans: 复核用模型
+      description:
+        en_US: Model used for semantic review. Empty = first available model. If no model is configured, medium/high rule hits are blocked without LLM review.
+        zh_Hans: 语义复核使用的模型。留空则用第一个可用模型。若系统里没有任何模型，则按规则 medium/high 直接拦截。
+      default: ''
+      required: false
+
+    - name: admin_user_ids
+      type: array[string]
+      label:
+        en_US: Admin user IDs
+        zh_Hans: 管理员用户 ID
+      description:
+        en_US: "IDs that receive a private ticket. For QQ official bots paste ONLY the openid after `person` in session monitor (32 hex chars), NOT the QQ number and NOT `C2C_MESSAGE_CREATE, person …`. Pipeline 'admin' permission is unrelated. Empty = JSONL only."
+        zh_Hans: "命中后接收私聊病单的账号。QQ 官方机器人请只填会话监控里 person 后面那串 openid（32 位），不要填 QQ 号，也不要整段粘贴 C2C_MESSAGE_CREATE, person …。流水线里把会话设成「管理员」不会通知到这里。留空则只写 JSONL。"
+      default: []
+      required: false
+
+    - name: admin_notify_bot
+      type: bot-selector
+      label:
+        en_US: Notify via bot
+        zh_Hans: 通知所用机器人
+      description:
+        en_US: Bot used to send the admin private message. Empty = the bot that received the group message.
+        zh_Hans: 用来给管理员发私聊的机器人。留空则用当前收到群消息的那个 bot。
+      default: ''
+      required: false
+
+    - name: admin_notify_mode
+      type: select
+      label:
+        en_US: Admin notify channel
+        zh_Hans: 管理员通知方式
+      description:
+        en_US: "private: DM only. private_then_group: DM first, post the ticket in the group if DM cannot be confirmed. group: always post the ticket in the group. QQ official bots cannot DM via LangBot send_message (adapter stub); without AppID/Secret this falls back to the group."
+        zh_Hans: "private：只私聊。private_then_group：先私聊，私聊无法确认成功就在本群补发病单。group：直接在本群发病单。QQ 官方适配器的 send_message 是空实现，不填 AppID/Secret 时私聊发不出去，会走群内补发。"
+      default: private_then_group
+      required: false
+      options:
+        - name: private_then_group
+          label:
+            en_US: Private, then group fallback
+            zh_Hans: 先私聊，失败则群内补发
+        - name: private
+          label:
+            en_US: Private only
+            zh_Hans: 仅私聊
+        - name: group
+          label:
+            en_US: Group only
+            zh_Hans: 仅群内通知
+
+    - name: qqofficial_app_id
+      type: string
+      label:
+        en_US: QQ official AppID
+        zh_Hans: QQ 官方机器人 AppID
+      description:
+        en_US: Required for real C2C admin DMs on QQ official bots. Same AppID as the bot in LangBot. Leave empty to skip HTTP C2C (group fallback still works).
+        zh_Hans: QQ 官方机器人要真正私聊管理员时必填，与 LangBot 里该 bot 的 AppID 相同。留空则不走 HTTP 私聊（仍可群内补发）。
+      default: ''
+      required: false
+
+    - name: qqofficial_secret
+      type: string
+      label:
+        en_US: QQ official AppSecret
+        zh_Hans: QQ 官方机器人 AppSecret
+      description:
+        en_US: Used only to obtain an access token for proactive C2C. Never sent to the review LLM. Leave empty if you only need group fallback.
+        zh_Hans: 仅用于换取 access_token 以主动私聊，不会送给复核 LLM。只需要群内补发时可留空。
+      default: ''
+      required: false
+
+    - name: qqofficial_sandbox
+      type: boolean
+      label:
+        en_US: QQ official sandbox API
+        zh_Hans: 使用 QQ 官方沙箱 API
+      description:
+        en_US: Use sandbox.api.sgroup.qq.com instead of production.
+        zh_Hans: 走 sandbox.api.sgroup.qq.com 而不是正式环境。
+      default: false
+      required: false
+
+    - name: qqofficial_trust_send_message
+      type: boolean
+      label:
+        en_US: Trust LangBot send_message on QQ official
+        zh_Hans: 信任 QQ 官方适配器的 send_message
+      description:
+        en_US: Leave off. LangBot's qqofficial adapter currently implements send_message as pass. Turn on only after upstream actually sends C2C.
+        zh_Hans: 默认关闭。LangBot 的 qqofficial 适配器目前 send_message 是空实现。只有上游真正能发 C2C 之后才打开。
+      default: false
+      required: false
+
+    - name: whitelist_user_ids
+      type: array[string]
+      label:
+        en_US: Whitelist user IDs
+        zh_Hans: 白名单用户 ID
+      description:
+        en_US: These senders skip detection.
+        zh_Hans: 这些发送者跳过检测。
+      default: []
+      required: false
+
+    - name: reply_on_block
+      type: boolean
+      label:
+        en_US: Reply in group on block
+        zh_Hans: 拦截时在群里回复
+      description:
+        en_US: When a message is blocked, also send a short refusal in the group.
+        zh_Hans: 拦截时是否在群里回一句拒绝提示。
+      default: true
+      required: false
+
+    - name: block_reply_text
+      type: string
+      label:
+        en_US: Block reply text
+        zh_Hans: 群内拒绝文案
+      description:
+        en_US: Text sent to the group when a message is blocked.
+        zh_Hans: 拦截时发到群里的文本。
+      default: ⚠️ 检测到提示词注入风险，请求已被拦截，已转交人工客服。
+      required: false
+
+    - name: incidents_path
+      type: string
+      label:
+        en_US: Incident log path
+        zh_Hans: 病单文件路径
+      description:
+        en_US: JSONL path relative to the plugin directory (or absolute).
+        zh_Hans: 相对插件目录的 JSONL 路径（也可填绝对路径）。
+      default: incidents.jsonl
+      required: false
+
+    - name: rule_medium_threshold
+      type: integer
+      label:
+        en_US: Medium severity threshold
+        zh_Hans: medium 判定阈值
+      description:
+        en_US: "Score at which a message becomes `medium`. Lower = stricter. PTD 4.1.0 default: 7."
+        zh_Hans: "达到多少分算 medium。调低更严格，调高更宽松。规则库默认 7。"
+      default: 7
+      required: false
+
+    - name: rule_high_threshold
+      type: integer
+      label:
+        en_US: High severity threshold
+        zh_Hans: high 判定阈值
+      description:
+        en_US: "Score at which a message becomes `high`. Must be >= the medium threshold. PTD 4.1.0 default: 11."
+        zh_Hans: "达到多少分算 high。必须不小于 medium 阈值，否则自动抬到与之相等。规则库默认 11。"
+      default: 11
+      required: false
+
+    - name: custom_keywords
+      type: array[string]
+      label:
+        en_US: Custom keywords
+        zh_Hans: 自定义关键词
+      description:
+        en_US: "One per line as `keyword:weight` (weight 1-10, defaults to 5). Case-insensitive substring match. Example: `帮我绕过审核:5`"
+        zh_Hans: "每行一条，格式 `关键词:权重`（权重 1-10，省略则按 5）。不区分大小写的子串匹配。例：`帮我绕过审核:5`"
+      default: []
+      required: false
+
+    - name: custom_regex_rules
+      type: array[string]
+      label:
+        en_US: Custom regex rules
+        zh_Hans: 自定义正则规则
+      description:
+        en_US: "One per line as `pattern:weight` (weight 1-10, defaults to 5). Python regex, case-insensitive. A trailing `:number` is read as the weight only when it is 1-10, so `\\d{2}:\\d{2}` stays intact. Invalid patterns are skipped with a log line. Avoid nested quantifiers — a catastrophic pattern can stall the handler."
+        zh_Hans: "每行一条，格式 `正则:权重`（权重 1-10，省略则按 5）。Python 正则，不区分大小写。结尾的 `:数字` 只有落在 1-10 时才当权重，所以 `\\d{2}:\\d{2}` 不会被截断。写错的正则会跳过并打日志。请避免嵌套量词，灾难性回溯会卡住处理流程。"
+      default: []
+      required: false
+
+    - name: disabled_rule_names
+      type: array[string]
+      label:
+        en_US: Disabled built-in rules
+        zh_Hans: 停用的内置规则
+      description:
+        en_US: "Rule names to switch off, one per line — use this when a built-in rule keeps flagging legitimate messages. Works for both regex rule names and built-in keywords. Full catalogue: `docs/RULES.md` in the plugin directory."
+        zh_Hans: "要关掉的规则名，每行一个——某条内置规则老是误杀正常消息时用它。正则规则名和内置关键词都适用。完整清单见插件目录下的 `docs/RULES.md`。"
+      default: []
+      required: false
+  components:
+    EventListener:
+      fromDirs:
+        - path: components/event_listener/
+execution:
+  python:
+    path: main.py
+    attr: PromptGuardian

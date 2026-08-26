@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: EventListener
+metadata:
+  name: default
+  label:
+    en_US: Prompt Guardian Listener
+    zh_Hans: 提示词注入防护监听
+  description:
+    en_US: Intercepts group messages, scores them with PTD 4.1, optionally reviews with an LLM, and files a human-support ticket on hits.
+    zh_Hans: 拦截群聊消息，用 PTD 4.1 打分，可选 LLM 复核，命中后记病单给人工客服。
+spec: {}
+execution:
+  python:
+    path: default.py
+    attr: DefaultEventListener

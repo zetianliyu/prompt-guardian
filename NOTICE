@@ -1,0 +1,40 @@
+Prompt Guardian
+==============
+
+This LangBot plugin includes `components/event_listener/ptd_core.py`, which is
+copied from:
+
+    https://github.com/oyxning/astrbot_plugin_antipromptinjector
+    File: ptd_core.py (Prompt Threat Detector Core 4.1.0)
+    Branch: master, commit d0de42cc2c34fb6663905884bef62771dde453d6
+    License: GNU Affero General Public License v3.0
+
+Modifications from upstream
+---------------------------
+
+Three regular expressions were changed to fix a portability defect. Upstream
+writes Unicode ranges as `\u{E0000}`, which is JavaScript/Rust regex syntax.
+Python's `re` module accepts only `\uXXXX` / `\UXXXXXXXX`, so `re.compile`
+raised `re.PatternError` and `PromptThreatDetector()` could not be constructed
+at all. The affected patterns are the "Unicode标签混淆" signature,
+`_detect_zero_width_payload`, and the ASCII-smuggling check in
+`_detect_markdown_exfil`.
+
+The escapes were rewritten to the equivalent Python form (`\u{E0000}` ->
+`\U000E0000`). No keyword, weight, threshold, or detection semantic was
+altered; the character ranges match upstream's intent exactly.
+
+No other change was made to the rule data.
+
+The original project is:
+
+    Anti-Prompt Injector for AstrBot
+    Author metadata: LumineStory / oyxning
+    https://github.com/oyxning/astrbot_plugin_antipromptinjector
+
+Prompt Guardian itself is a new LangBot 4.x plugin (event wiring, incident
+tickets, admin notify). Because it redistributes AGPL-covered rule-engine
+source, the combined work is licensed under AGPL-3.0.
+
+If you modify and run this plugin as a network service, AGPL-3.0 requires
+you to offer the corresponding source to users who interact with it.
