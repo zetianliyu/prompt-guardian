@@ -4,7 +4,7 @@ metadata:
   author: dxzk
   name: PromptGuardian
   repository: 'https://github.com/zetianliyu/prompt-guardian'
-  version: 0.1.4
+  version: 0.1.5
   description:
     en_US: Rule-based plus LLM-reviewed prompt-injection guard. Blocks jailbreaks in group chats and files a ticket (group, user, question) for human follow-up.
     zh_Hans: 规则预筛 + LLM 复核的提示词注入防护。拦截群聊越狱，并记录「哪个群、哪个用户、问了什么」供人工客服处理。
@@ -249,8 +249,8 @@ spec:
         en_US: Incident log path
         zh_Hans: 病单文件路径
       description:
-        en_US: JSONL path relative to the plugin directory (or absolute).
-        zh_Hans: 相对插件目录的 JSONL 路径（也可填绝对路径）。
+        en_US: "JSONL file name, or an absolute path. The installed plugin directory is read-only, so a bare name is written into the first writable runtime directory instead (`/data`, then `$HOME`, then the temp dir). Run `!pg where` to see the path actually in use."
+        zh_Hans: "JSONL 文件名，也可填绝对路径。已安装的插件目录是只读的，所以只填文件名时会写入运行时第一个可写目录（依次尝试 `/data`、`$HOME`、临时目录）。用 `!pg where` 可以看到实际使用的路径。"
       default: incidents.jsonl
       required: false
 
@@ -260,8 +260,8 @@ spec:
         en_US: DM admins for passed reviews too
         zh_Hans: 复核放行也私聊管理员
       description:
-        en_US: "Send the full review record (local score, LLM verdict, raw model output, original text) to admins even when the message is allowed through. Turn this on to inspect passed reviews: LangBot only fills its plugin log panel when the worker is launched with a captured stderr pipe, which the normal production path does not do, so a DM is the reliable channel. Noisy in `active` mode."
-        zh_Hans: "即使消息被复核放行，也把完整复核记录（本地分数、LLM 结论、模型原始返回、原文）私聊给管理员。想查看放行的复核结果就打开它：LangBot 只有在以捕获 stderr 的方式启动插件进程时才会填充插件日志面板，而正式部署路径并不这样做，所以私聊是可靠渠道。`active` 模式下会比较吵。"
+        en_US: "Send the full review record (local score, LLM verdict, raw model output, original text) to admins even when the message is allowed through. Useful as a push channel; for pulling records on demand use `!pg log` instead. Noisy in `active` mode."
+        zh_Hans: "即使消息被复核放行，也把完整复核记录（本地分数、LLM 结论、模型原始返回、原文）私聊给管理员。适合当作实时推送；想按需查看请改用 `!pg log`。`active` 模式下会比较吵。"
       default: false
       required: false
 
@@ -286,8 +286,8 @@ spec:
         en_US: Review audit path
         zh_Hans: 复核审计文件路径
       description:
-        en_US: "JSONL path for every message actually sent to the review LLM, including passed verdicts. A relative path resolves inside the extracted plugin directory, which under Docker lives inside the container — set an absolute path under a mounted volume to read it from the host."
-        zh_Hans: "记录每次实际送入复核 LLM 的消息（包括复核后放行）的 JSONL 路径。相对路径落在插件解压目录下；Docker 部署时那是容器内部路径，想在宿主机直接查看请填一个挂载卷下的绝对路径。"
+        en_US: "JSONL file name for every message actually sent to the review LLM, including passed verdicts. The installed plugin directory is read-only, so a bare name is written into the first writable runtime directory (`/data`, then `$HOME`, then the temp dir); an absolute path under a mounted volume is honoured. Read the records with `!pg log`, and `!pg where` for the path in use."
+        zh_Hans: "记录每次实际送入复核 LLM 的消息（包括复核后放行）的 JSONL 文件名。已安装的插件目录是只读的，所以只填文件名时会写入运行时第一个可写目录（依次尝试 `/data`、`$HOME`、临时目录）；填挂载卷下的绝对路径也会被采用。用 `!pg log` 直接看记录，`!pg where` 看实际路径。"
       default: review_audit.jsonl
       required: false
 
@@ -349,6 +349,9 @@ spec:
     EventListener:
       fromDirs:
         - path: components/event_listener/
+    Command:
+      fromDirs:
+        - path: components/commands/
 execution:
   python:
     path: main.py

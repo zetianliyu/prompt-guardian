@@ -20,6 +20,7 @@ from admin_ids import adapter_from_bot_info, coerce_admin_ids, needs_group_fallb
 from bot_credentials import qqofficial_credentials  # noqa: E402
 from plugin_log import log  # noqa: E402
 from ptd_core import PromptThreatDetector  # noqa: E402
+import record_store  # noqa: E402
 from recorder import IncidentRecorder, NotifyResult, _safe_str  # noqa: E402
 from rule_overrides import RuleOverrides, config_fingerprint  # noqa: E402
 
@@ -318,16 +319,13 @@ class DefaultEventListener(EventListener):
     ) -> tuple[str, str]:
         """Persist a review outcome. Returns ``(resolved_path, error)``.
 
-        The caller surfaces the error, because LangBot only feeds its plugin log
-        panel when the worker is launched with a captured stderr pipe — see the
-        README note — so an invisible log line is not a usable failure channel.
+        The caller surfaces the error, because LangBot never launches a plugin
+        worker with a captured stderr pipe, so the WebUI log panel cannot show
+        an invisible log line — see the README note. ``record_store`` also keeps
+        the row in memory so ``!pg log`` can show it even when nothing on disk
+        is writable.
         """
         path_value = _safe_str(cfg.get("review_audit_path"), "review_audit.jsonl")
-        if os.path.isabs(path_value):
-            path = path_value
-        else:
-            base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            path = os.path.join(base, path_value)
         llm = llm or {}
         row = {
             "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -349,16 +347,11 @@ class DefaultEventListener(EventListener):
             "llm_reason": llm.get("reason", ""),
             "llm_raw": _clip(llm.get("raw_response"), 10000),
         }
-        try:
-            directory = os.path.dirname(path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
-                fh.flush()
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            log.error(f"write review audit to {path} failed: {error}")
+        path, error = record_store.append(
+            record_store.KIND_REVIEW, row, path_value, "review_audit.jsonl"
+        )
+        if error:
+            log.error(f"write review audit to {path or '<no writable dir>'} failed: {error}")
             return path, error
         log.info(f"review audit ({action}) appended to {path}")
         return path, ""

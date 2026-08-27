@@ -46,6 +46,9 @@ def check_syntax() -> None:
         os.path.join(LISTENER, "bot_credentials.py"),
         os.path.join(LISTENER, "notify_manager.py"),
         os.path.join(LISTENER, "qqofficial_c2c.py"),
+        os.path.join(LISTENER, "plugin_log.py"),
+        os.path.join(LISTENER, "record_store.py"),
+        os.path.join(ROOT, "components", "commands", "pg.py"),
         os.path.join(ROOT, "scripts", "verify_ptd.py"),
         os.path.join(ROOT, "scripts", "dump_rules.py"),
     ]
@@ -358,11 +361,14 @@ def check_component_discovery() -> None:
     components and cannot be managed in the WebUI. Nothing else fails loudly,
     which is why this needs a test.
     """
+    from langbot_plugin.api.definition.components.command.command import Command
     from langbot_plugin.api.definition.components.common.event_listener import (
         EventListener,
     )
     from langbot_plugin.cli.utils.page_components import discover_plugin_components
     from langbot_plugin.utils.discover.engine import ComponentDiscoveryEngine
+
+    expected_bases = {"EventListener": EventListener, "Command": Command}
 
     previous_cwd = os.getcwd()
     os.chdir(ROOT)
@@ -381,17 +387,22 @@ def check_component_discovery() -> None:
                 f"discovery found 0 components while manifest declares {list(declared)}"
                 " — a component yaml is probably missing its `spec` key"
             )
-        if len(components) != len(declared):
-            fail(f"expected {len(declared)} component(s), discovered {len(components)}")
-
-        listener = components[0]
-        if listener.kind != "EventListener":
-            fail(f"unexpected component kind {listener.kind}")
-        component_class = listener.get_python_component_class()
-        if not issubclass(component_class, EventListener):
-            fail(f"{component_class} is not an EventListener")
-        component_class()
-        ok(f"discovery loaded {listener.kind}/{listener.metadata.name} and instantiated it")
+        found_kinds = {component.kind for component in components}
+        missing = set(declared) - found_kinds
+        if missing:
+            fail(f"declared but not discovered: {sorted(missing)}")
+        for component in components:
+            base = expected_bases.get(component.kind)
+            if base is None:
+                fail(f"unexpected component kind {component.kind}")
+            component_class = component.get_python_component_class()
+            if not issubclass(component_class, base):
+                fail(f"{component_class} is not a {base.__name__}")
+            component_class()
+        names = ", ".join(
+            f"{component.kind}/{component.metadata.name}" for component in components
+        )
+        ok(f"discovery loaded and instantiated {len(components)} component(s): {names}")
     finally:
         os.chdir(previous_cwd)
 
@@ -1183,6 +1194,225 @@ def check_single_group_reply() -> None:
     ok("refusal and fallback ticket travel in a single reply")
 
 
+def check_record_store() -> None:
+    """A relative record path must never be anchored to the plugin directory.
+
+    LangBot chmods the installed plugin tree to 0o555/0o444 and bind-mounts it
+    read-only at ``/plugin``, so the old behaviour (join the plugin root) made
+    every append fail with PermissionError while the DM path kept working — the
+    exact symptom this check exists to prevent from coming back.
+    """
+    import record_store
+
+    original_root = record_store.plugin_root
+    original_tempdir = tempfile.tempdir
+    original_env = {
+        key: os.environ.get(key)
+        for key in (record_store.ENV_DATA_DIR, "HOME")
+    }
+
+    def restore() -> None:
+        record_store.plugin_root = original_root
+        tempfile.tempdir = original_tempdir
+        for key, value in original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        record_store.resolve_dir(refresh=True)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        readonly = os.path.join(tmp, "plugin")
+        writable = os.path.join(tmp, "data")
+        os.makedirs(readonly)
+        os.makedirs(writable)
+        os.chmod(readonly, 0o555)
+        try:
+            record_store.plugin_root = lambda: readonly
+            if os.geteuid() != 0:
+                if not record_store.probe_writable(readonly):
+                    fail(f"{readonly} was chmod 0o555 but still passed the write probe")
+
+            os.environ[record_store.ENV_DATA_DIR] = writable
+            directory, _label = record_store.resolve_dir(refresh=True)
+            if directory != writable:
+                fail(f"expected the writable override {writable}, resolved {directory}")
+            path, note = record_store.resolve_path("review_audit.jsonl", "x.jsonl")
+            if path != os.path.join(writable, "review_audit.jsonl"):
+                fail(f"relative name resolved to {path}")
+            if note:
+                fail(f"unexpected note for a plain relative name: {note}")
+
+            bad_abs = os.path.join(readonly, "review_audit.jsonl")
+            path, note = record_store.resolve_path(bad_abs, "x.jsonl")
+            if os.geteuid() != 0:
+                if path != os.path.join(writable, "review_audit.jsonl") or not note:
+                    fail(f"unwritable absolute path was not redirected: {path} / {note}")
+
+            written, error = record_store.append(
+                "verify-review", {"probe": 1}, "", "review_audit.jsonl"
+            )
+            if error or written != os.path.join(writable, "review_audit.jsonl"):
+                fail(f"append failed: {written} / {error}")
+            rows, source, _ = record_store.tail("verify-review", 5, "", "review_audit.jsonl")
+            if source != "file" or not rows or rows[-1].get("probe") != 1:
+                fail(f"tail did not read the file back: {source} / {rows}")
+
+            # Nothing writable anywhere: the row must still be readable from memory.
+            os.environ[record_store.ENV_DATA_DIR] = readonly
+            os.environ["HOME"] = readonly
+            tempfile.tempdir = readonly
+            record_store.resolve_dir(refresh=True)
+            if os.geteuid() != 0:
+                written, error = record_store.append(
+                    "verify-memory", {"probe": 2}, "", "review_audit.jsonl"
+                )
+                if not error:
+                    fail("append reported success with no writable directory")
+                rows, source, _ = record_store.tail(
+                    "verify-memory", 5, "", "review_audit.jsonl"
+                )
+                if source != "memory" or not rows or rows[-1].get("probe") != 2:
+                    fail(f"memory fallback lost the record: {source} / {rows}")
+        finally:
+            os.chmod(readonly, 0o755)
+            restore()
+    ok("record paths resolve to a writable directory, with a memory fallback")
+
+
+def check_pg_command() -> None:
+    """The ``!pg`` command is the only working way to read records back.
+
+    LangBot's plugin log panel has no source: the Runtime creates the worker
+    controller without ``capture_stderr=True``, so ``PluginLogBuffer`` never
+    gets a stream. This check covers dispatch, the admin gate, and that
+    ``where`` reports a real path instead of guessing.
+    """
+    import asyncio
+    import importlib.util
+
+    import record_store
+
+    module_path = os.path.join(ROOT, "components", "commands", "pg.py")
+    spec = importlib.util.spec_from_file_location("pg_command", module_path)
+    if spec is None or spec.loader is None:
+        fail(f"cannot load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    from langbot_plugin.api.entities.builtin.command.context import ExecuteContext
+    from langbot_plugin.api.entities.builtin.provider.session import (
+        LauncherTypes,
+        Session,
+    )
+
+    class FakePlugin:
+        def __init__(self, config: dict) -> None:
+            self._config = config
+
+        def get_config(self) -> dict:
+            return self._config
+
+    def context_for(params: list[str], sender: str, privilege: int) -> ExecuteContext:
+        return ExecuteContext(
+            query_id=1,
+            session=Session(
+                launcher_type=LauncherTypes.GROUP,
+                launcher_id="g1",
+                sender_id=sender,
+            ),
+            command_text=" ".join(["pg"] + params),
+            full_command_text="!" + " ".join(["pg"] + params),
+            command="pg",
+            crt_command="pg",
+            params=list(params),
+            crt_params=list(params),
+            privilege=privilege,
+        )
+
+    async def run(command, params: list[str], sender: str, privilege: int) -> str:
+        chunks = []
+        async for value in command._execute(context_for(params, sender, privilege)):
+            chunks.append(value.text or "")
+        return "\n".join(chunks)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_env = os.environ.get(record_store.ENV_DATA_DIR)
+        os.environ[record_store.ENV_DATA_DIR] = tmp
+        record_store.resolve_dir(refresh=True)
+        # Earlier checks share this process and have already filled the ring
+        # buffer, so the "no records yet" assertion below needs a clean slate.
+        record_store._memory.pop(record_store.KIND_REVIEW, None)
+        record_store._memory.pop(record_store.KIND_INCIDENT, None)
+        try:
+            command = module.PromptGuardianCommand()
+            command.plugin = FakePlugin({"admin_user_ids": ["10001"]})
+            asyncio.run(command.initialize())
+
+            for name in ("log", "tickets", "where", "stats", "*", "logs", "help"):
+                if name not in command.registered_subcommands:
+                    fail(f"subcommand {name!r} was not registered")
+
+            denied = asyncio.run(run(command, ["log"], "99999", 1))
+            if "管理员" not in denied:
+                fail(f"non-admin was not refused: {denied!r}")
+
+            empty = asyncio.run(run(command, ["log"], "10001", 1))
+            if "还没有复核记录" not in empty:
+                fail(f"unexpected empty-log reply: {empty!r}")
+
+            record_store.append(
+                record_store.KIND_REVIEW,
+                {
+                    "time": "2026-08-27T10:00:00+00:00",
+                    "action": "passed",
+                    "group_name": "测试群",
+                    "sender_name": "张三",
+                    "ptd_score": 9,
+                    "ptd_severity": "medium",
+                    "ptd_reason": "命中关键词",
+                    "llm_attempted": True,
+                    "llm_usable": True,
+                    "llm_is_injection": False,
+                    "llm_confidence": 0.94,
+                    "llm_reason": "普通问题",
+                    "llm_raw": '{"is_injection": false}',
+                    "question": "猫娘是什么动漫角色？",
+                },
+                "",
+                record_store.DEFAULT_REVIEW_NAME,
+            )
+            listed = asyncio.run(run(command, ["log"], "10001", 1))
+            for needle in ("测试群", "猫娘是什么动漫角色？", "普通问题", "放行"):
+                if needle not in listed:
+                    fail(f"{needle!r} missing from !pg log output: {listed!r}")
+
+            # Privilege alone is enough, for admins whose group id differs from
+            # the C2C openid in the config.
+            privileged = asyncio.run(run(command, ["log"], "not-an-admin", 2))
+            if "管理员" in privileged and "测试群" not in privileged:
+                fail("privileged caller was refused")
+
+            where = asyncio.run(run(command, ["where"], "10001", 1))
+            if tmp not in where or "进程工作目录" not in where:
+                fail(f"!pg where did not report the resolved path: {where!r}")
+
+            stats = asyncio.run(run(command, ["stats"], "10001", 1))
+            if "复核审计" not in stats or "内存" not in stats:
+                fail(f"unexpected !pg stats reply: {stats!r}")
+
+            unknown = asyncio.run(run(command, ["nope"], "10001", 1))
+            if "未知子命令" not in unknown:
+                fail(f"unknown subcommand was not handled: {unknown!r}")
+        finally:
+            if original_env is None:
+                os.environ.pop(record_store.ENV_DATA_DIR, None)
+            else:
+                os.environ[record_store.ENV_DATA_DIR] = original_env
+            record_store.resolve_dir(refresh=True)
+    ok("!pg log / tickets / where / stats dispatch, with the admin gate enforced")
+
+
 def main() -> None:
     check_syntax()
     check_manifest()
@@ -1196,11 +1426,13 @@ def main() -> None:
     check_notify_manager()
     check_review_failure_policy()
     check_review_audit_persistence()
+    check_record_store()
     check_stderr_logging()
     if sdk_available():
         check_llm_parser()
         check_sdk_wiring()
         check_component_discovery()
+        check_pg_command()
         check_recorder()
         check_notify_routing()
         check_pass_report()

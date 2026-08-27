@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any
@@ -20,6 +18,7 @@ from notify_manager import (
     validate_admin_target,
 )
 from qqofficial_c2c import QQOfficialC2CSender
+import record_store
 
 CST = timezone(timedelta(hours=8))
 QUESTION_LIMIT = 1500
@@ -59,13 +58,6 @@ class IncidentRecorder:
         self.plugin = plugin
         self._lock = asyncio.Lock()
         self._qq_c2c = QQOfficialC2CSender()
-
-    def _resolve_path(self, incidents_path: str) -> str:
-        path = (incidents_path or "incidents.jsonl").strip() or "incidents.jsonl"
-        if os.path.isabs(path):
-            return path
-        base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        return os.path.join(base, path)
 
     def build_incident(
         self,
@@ -118,15 +110,15 @@ class IncidentRecorder:
         )
 
     async def append_jsonl(self, incidents_path: str, incident: dict[str, Any]) -> str:
-        path = self._resolve_path(incidents_path)
-        line = json.dumps(incident, ensure_ascii=False) + "\n"
         async with self._lock:
-            directory = os.path.dirname(path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(path, "a", encoding="utf-8") as fh:
-                fh.write(line)
-                fh.flush()
+            path, error = record_store.append(
+                record_store.KIND_INCIDENT,
+                incident,
+                incidents_path,
+                record_store.DEFAULT_INCIDENT_NAME,
+            )
+        if error:
+            raise OSError(f"{path or '<no writable dir>'}: {error}")
         return path
 
     def _target_types(self, adapter: str) -> list[str]:

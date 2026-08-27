@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Command
+metadata:
+  name: pg
+  label:
+    en_US: Prompt Guardian records
+    zh_Hans: 提示词注入防护记录
+  description:
+    en_US: "Read Prompt Guardian's review records and tickets from chat: !pg log / tickets / where / stats. Admins only."
+    zh_Hans: "在聊天里查看复核记录与拦截病单：!pg log / tickets / where / stats。仅管理员可用。"
+spec: {}
+execution:
+  python:
+    path: pg.py
+    attr: PromptGuardianCommand

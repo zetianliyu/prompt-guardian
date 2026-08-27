@@ -6,6 +6,79 @@ This is **not** an AstrBot plugin. The detection rule library (PTD 4.1.0) comes 
 
 Chinese install notes: `readme/README_zh_Hans.md`.
 
+## What changed in v0.1.5
+
+This release is about one complaint: the log panel is empty and the record files
+contain nothing. Two separate causes — one a plugin bug, one a LangBot limit.
+
+**Record files could not be written at all (fixed).** LangBot installs a plugin
+as a verified **read-only** artifact: `PluginArtifactStore.install_package()`
+calls `_make_tree_read_only()`, which chmods the extracted tree to `0o555`/`0o444`,
+and the production worker profile additionally bind-mounts it read-only at
+`/plugin` inside nsjail with `--cwd /plugin`. A relative path such as
+`review_audit.jsonl` therefore landed inside a read-only tree and every append
+raised `PermissionError` / `Read-only file system`. The ticket write was already
+wrapped in a `try/except` that only logged, and the log panel is dead, so it
+looked like nothing happened at all. The `review_audit.jsonl` you can open in
+the plugin directory is a stale file from before packaging — not a runtime
+write. `incidents.jsonl` was silently failing the same way; the admin DM working
+is what hid it.
+
+Record paths are now resolved to the first directory that survives a real
+create-and-delete probe: `$PROMPT_GUARDIAN_DATA_DIR`, then `/data`, then the
+installation's `data/`, then the plugin directory (dev mode only), then `$HOME`,
+then the temp dir. An absolute path is still honoured; if its parent is not
+writable the plugin falls back and says so in `!pg where` instead of failing
+silently.
+
+**Where the plugin lives after you upload it.** The installed plugin is not the
+directory you uploaded:
+
+| | Host path | Inside the sandbox |
+|---|---|---|
+| Plugin code | `data/plugin-runtime/artifacts/sha256/<sha256>/code/` | `/plugin` (**read-only**) |
+| Writable data | `data/plugin-runtime/installations/<uuid>/data/` | `/data` |
+| HOME | `data/plugin-runtime/installations/<uuid>/home/` | `/home` |
+| Temp | `data/plugin-runtime/installations/<uuid>/tmp/` | `/tmp` |
+
+Paths are relative to LangBot's own working directory — `/app/data/...` in the
+container, so `data/...` under your compose directory on the host. `<sha256>`
+and `<uuid>` change on every reinstall, so don't guess: run `!pg where` and read
+the absolute path the running process reports.
+
+**New `!pg` command — read the records from chat.**
+
+```
+!pg log [n]      recent review records (default 3, max 10)
+!pg tickets [n]  recent blocked tickets
+!pg where        the real file paths plus a writability diagnosis
+!pg stats        record counts
+```
+
+The prefix follows your LangBot setting (`!` by default). Aliases: `logs`/`review`,
+`ticket`, `path`/`paths`, `stat`, `help`. **Admins only** — the caller must match
+**Admin user IDs** or be privileged (level ≥ 2) according to LangBot itself,
+because the records quote group members verbatim. The last 200 records are also
+kept in the plugin process's memory, so `!pg log` still answers even when no
+directory turns out to be writable (cleared on restart).
+
+**Why the log panel is permanently empty (LangBot side, not fixable here).**
+`PluginLogBuffer` has exactly one source, the plugin subprocess's stderr:
+`runtime/io/handlers/plugin.py` does `if self.stdio_process.stderr is not None:
+self.log_buffer.start_reader(...)`. stderr is only a pipe when the controller is
+built with `capture_stderr=True` (`stderr=asyncio.subprocess.PIPE if
+self.capture_stderr else None`), and `worker_launcher.create_controller()` never
+passes it — `capture_stderr=True` appears zero times in SDK 0.5.5. So
+`process.stderr is None`, `start_reader()` is never called, and the panel has no
+source no matter what the plugin writes. Only LangBot's own diagnostic entries
+(`log_buffer.add_entry()`) can appear there. Fixing it means adding
+`capture_stderr=True` upstream; this plugin does not touch that. The v0.1.2 note
+claiming the panel would now have content was wrong, and is retracted here.
+
+The offline suite is now 68 checks, adding the read-only path fallback, the
+memory fallback, `!pg` dispatch with its admin gate, and discovery of both
+component kinds.
+
 ## What changed in v0.1.4
 
 **Passed reviews can be DM'd to admins.** New **`notify_on_pass`** (default off):
@@ -40,12 +113,6 @@ front with a message asking for the openid.
 Tickets now carry `notify_platform` / `notify_transport`. The offline suite runs
 63 checks, including per-platform transport routing and the passed-review DM.
 
-### Known issue
-
-Two ways of inspecting review records still do not work: the plugin log panel
-stays empty and `review_audit.jsonl` records nothing. Still being investigated —
-do not rely on them. Use the `notify_on_pass` DM above instead.
-
 ## How it works
 
 ```
@@ -69,7 +136,7 @@ LLM review modes (same meaning as the AstrBot prototype):
 
 LLM JSON must report `is_injection: true` **and** `confidence >= 0.6` to confirm. The review prompt now requires a valid JSON object with concrete values, not placeholder text. If a review was actually attempted but its output is malformed, the message fails open; if no model is configured, local `medium` / `high` rules remain authoritative.
 
-Every review attempt is written to the plugin stderr log, including clean messages that are ultimately passed through. Each audit entry includes the local score/severity, selected review model, parsed verdict/reason, bounded raw model output, and final pass/block decision. The same records are persisted to `review_audit.jsonl` (configurable via `review_audit_path`), separately from blocked-message tickets in `incidents.jsonl`; passed messages are not privately notified to admins.
+Every review attempt is recorded, including clean messages that are ultimately passed through. Each audit entry includes the local score/severity, selected review model, parsed verdict/reason, bounded raw model output, and final pass/block decision. Read them with `!pg log`; they are also appended to `review_audit.jsonl` (name configurable via `review_audit_path`, location resolved as described above — `!pg where` prints it), separately from blocked-message tickets in `incidents.jsonl`. The plugin log panel cannot show any of this; see the v0.1.5 note.
 
 ## Install
 
@@ -155,7 +222,7 @@ Each line of `incidents.jsonl`:
 python scripts/verify_ptd.py
 ```
 
-Checks syntax, manifest YAML, PTD scoring (benign / jailbreak / Unicode obfuscation), LLM JSON parsing, and the incident recorder.
+Checks syntax, manifest YAML, PTD scoring (benign / jailbreak / Unicode obfuscation), LLM JSON parsing, record-path fallback on a read-only directory, `!pg` subcommand dispatch and its admin gate, component discovery, and the incident recorder. 68 checks in total.
 
 The LLM-parser, SDK-wiring and recorder checks need the plugin SDK. Without it they are skipped rather than failing:
 

@@ -8,6 +8,76 @@ LangBot 4.x 插件。用 **规则预筛 + LLM 复核** 识别群聊里的提示�
 
 这不是 AstrBot 插件。规则库（PTD 4.1.0）来自 [oyxning/astrbot_plugin_antipromptinjector](https://github.com/oyxning/astrbot_plugin_antipromptinjector)。关键词 / 权重 / 阈值均未改动；有 3 条正则做了修复——上游用了 JS 风格的 `\u{XXXX}` 转义，Python `re` 不接受，会让检测器连构造都失败。详见仓库根目录 `NOTICE`、`LICENSE`，整体按 AGPL-3.0 发布。
 
+## v0.1.5 更新内容
+
+这一版专门解决「日志看不到、记录文件里什么都没有」。两件事，一件是插件的 bug，一件是 LangBot 侧的限制。
+
+### 1. 记录文件写不进去的真正原因（已修复）
+
+LangBot 安装插件时会把插件目录变成**只读**。`PluginArtifactStore.install_package()` 解压后调用 `_make_tree_read_only()`，把整棵目录树 chmod 成 `0o555` / `0o444`；生产用的 shared 进程配置还会用 nsjail 把它以只读方式挂到 `/plugin`，并把工作目录设成 `/plugin`。
+
+所以 `review_audit.jsonl`、`incidents.jsonl` 这类相对路径落在只读目录里，每次追加都抛 `PermissionError` / `Read-only file system`。病单写入本来就套着 try/except 只打日志，而日志面板又是空的（见第 4 条），于是表现成「什么都没发生」。**你手动打开插件目录看到的那个 `review_audit.jsonl`，是打包前就存在的旧文件，不是运行时写的。** 拦截病单 `incidents.jsonl` 同样一直没写进去，只是私聊通知能发出去，掩盖了这一点。
+
+现在改为自动挑选可写目录，依次尝试：
+
+1. 环境变量 `PROMPT_GUARDIAN_DATA_DIR`
+2. `/data`（沙箱里每个安装实例的数据目录）
+3. 安装目录下的 `data/`
+4. 插件目录（只有开发模式下确实可写时才会命中）
+5. `$HOME`
+6. 临时目录
+
+判断方式是**真的建一个文件再删掉**，不是 `os.access`——只读挂载和只读 chmod 在 `access()` 下的表现会随挂载方式和 uid 变化。填绝对路径依然优先采用；如果那个目录不可写，会退回自动目录，并在 `!pg where` 里说明原因，而不是静默失败。
+
+### 2. 插件上传 LangBot 之后在哪
+
+你的猜测是对的，目录确实变了。安装后插件不再是你上传的那份目录：
+
+| 内容 | 宿主机路径 | 沙箱内路径 |
+|---|---|---|
+| 插件代码 | `data/plugin-runtime/artifacts/sha256/<sha256>/code/` | `/plugin`（**只读**） |
+| 可写数据目录 | `data/plugin-runtime/installations/<uuid>/data/` | `/data` |
+| HOME | `data/plugin-runtime/installations/<uuid>/home/` | `/home` |
+| 临时目录 | `data/plugin-runtime/installations/<uuid>/tmp/` | `/tmp` |
+
+这些路径相对 LangBot 自己的工作目录。Docker 部署时容器内是 `/app/data/...`，宿主机上就是 compose 目录下的 `data/...`（`data/` 一般是挂载卷，所以能直接翻）。
+
+`<sha256>` 和 `<uuid>` 每次重装都会变，所以别去猜——在聊天里发 `!pg where`，它打印的是插件进程里实测出来的绝对路径。
+
+### 3. 新增 `!pg` 命令：在聊天里查记录
+
+日志面板不可用是 LangBot 侧的问题（第 4 条），插件改不了，所以记录改成用命令读回来：
+
+```
+!pg log [条数]      最近的复核记录（默认 3 条，最多 10 条）
+!pg tickets [条数]  最近的拦截病单
+!pg where           记录文件的实际路径 + 可写性诊断
+!pg stats           记录条数统计
+```
+
+命令前缀跟随 LangBot 的设置（默认 `!`）。别名：`logs` / `review`、`ticket`、`path` / `paths`、`stat`、`help`。
+
+**仅管理员可用**：命中配置里的「管理员用户 ID」，或者 LangBot 判定该会话权限 ≥ 2。记录里含群成员原话，不能让群里任何人随手查。QQ 官方机器人要注意，群内成员 openid 和私聊 openid 不是同一个，这种情况下靠 LangBot 的会话管理员身份放行。
+
+除文件之外，最近 200 条记录还留在插件进程内存里。万一所有候选目录都不可写，`!pg log` 依然看得到内容（插件重启后清空），不会像以前那样一无所有。
+
+### 4. 日志面板为什么永远是空的（LangBot 侧，插件无法修复）
+
+上游代码翻到底了，插件侧无解，链路是这样断的：
+
+- `PluginLogBuffer` 只有一个数据来源，就是插件子进程的 stderr：`runtime/io/handlers/plugin.py` 里 `if self.stdio_process.stderr is not None: self.log_buffer.start_reader(...)`
+- 而 stderr 只有在 `StdioClientController(capture_stderr=True)` 时才是管道：`stderr=asyncio.subprocess.PIPE if self.capture_stderr else None`
+- `worker_launcher.create_controller()` 建 controller 时**从不传** `capture_stderr`——`capture_stderr=True` 这个写法在整个 SDK 0.5.5 里出现次数为 0
+
+于是 `process.stderr is None`，`start_reader()` 永不调用，面板没有任何来源。插件往 stderr 写什么、格式对不对，都不会出现在面板里。面板里唯一可能出现的内容是 LangBot 自己写的诊断条目（`log_buffer.add_entry()`）。
+
+要修得在 LangBot 侧给 `create_controller()` 补上 `capture_stderr=True`。那是上游改动，本插件没有动它。所以之前 v0.1.2 说「日志面板现在会有内容」是错的，这里更正。
+
+### 5. 其它
+
+- 自检增加到 68 项，新增：只读目录下的路径回退、内存兜底、`!pg` 四个子命令的分发与管理员门禁、两种组件（EventListener + Command）都能被发现并实例化。
+- `incidents_path` / `review_audit_path` 两个配置项的说明改了：只填文件名即可，插件自己找可写目录。
+
 ## v0.1.4 更新内容
 
 ### 1. 复核放行也能私聊通知管理员
@@ -38,10 +108,6 @@ LangBot 4.x 插件。用 **规则预筛 + LLM 复核** 识别群聊里的提示�
 - 病单里新增 `notify_platform` / `notify_transport`，能看出这次实际走了哪条链路。
 - 自检共 63 项，新增覆盖：各平台链路选择、企微 ID 格式校验、QQ 有凭据时不回落到空实现、放行记录能私聊送达。
 
-### 已知问题
-
-插件日志面板和 `review_audit.jsonl` 这两条查看途径仍然不可用：面板没有内容，审计文件也没有记录。仍在排查中，请勿依赖。要查看复核放行的结果，请用上面第 1 条的私聊通知。
-
 ## 流水线
 
 ```
@@ -63,7 +129,7 @@ LLM 复核模式（语义与 AstrBot 原型一致）：
 - `active`：每条群消息都复核
 - `disabled`：只靠规则；`medium` / `high` 直接拦截
 
-LLM 必须同时给出 `is_injection=true` 且 `confidence >= 0.6` 才算确认。复核提示词现在要求返回带具体值的合法 JSON，不再使用 `true/false`、`0-1 数字` 这种会诱导模型照抄的占位符。若确实调用了复核模型但输出无法解析，按 fail open 放行；若没有配置模型，则继续以本地 `medium` / `high` 规则为准。插件日志会记录每次实际复核（包括最终放行的消息）：本地分数/级别、LLM 原始输出（有限截断）、解析结果、原因和最终动作。
+LLM 必须同时给出 `is_injection=true` 且 `confidence >= 0.6` 才算确认。复核提示词现在要求返回带具体值的合法 JSON，不再使用 `true/false`、`0-1 数字` 这种会诱导模型照抄的占位符。若确实调用了复核模型但输出无法解析，按 fail open 放行；若没有配置模型，则继续以本地 `medium` / `high` 规则为准。每次实际复核（包括最终放行的消息）都会记一条审计：本地分数/级别、LLM 原始输出（有限截断）、解析结果、原因和最终动作。查看方式是 `!pg log`，不是插件日志面板——面板拿不到插件的输出，原因见 v0.1.5 第 4 条。
 
 ## 安装
 
@@ -121,10 +187,10 @@ QQ 官方主动私聊还要求：管理员曾经私聊过这个机器人，并�
 | 白名单用户 ID | 空 | 跳过检测 |
 | 拦截时在群里回复 | 开 | 是否在群里回拒绝文案 |
 | 群内拒绝文案 | ⚠️ 检测到提示词注入风险… | 可改 |
-| 病单文件路径 | `incidents.jsonl` | 相对插件目录，也可填绝对路径 |
+| 病单文件路径 | `incidents.jsonl` | 只填文件名即可，插件自动找可写目录；也可填绝对路径 |
 | 复核放行也私聊管理员 | 关 | 打开后放行的复核记录也私聊发出，见上文 |
 | 放行记录私聊失败时群内补发 | 关 | 群内所有人可见，非工作人员群请勿开 |
-| 复核审计文件路径 | `review_audit.jsonl` | Docker 下相对路径在容器内，建议填挂载卷绝对路径 |
+| 复核审计文件路径 | `review_audit.jsonl` | 同上；实际落盘位置用 `!pg where` 查 |
 | medium 判定阈值 | 7 | 达到多少分算 medium |
 | high 判定阈值 | 11 | 达到多少分算 high |
 | 自定义关键词 | 空 | 每行 `关键词:权重` |
@@ -166,7 +232,13 @@ python scripts/dump_rules.py
 
 一个已知取舍：停用某条规则时，规则库先前因它给出的协同加权（如 `multi_high_risk`）不会一并撤销，可能略微高估分数。对防护插件来说宁可偏严。
 
-**复核审计**。所有实际调用过复核 LLM 的消息（包括复核后放行的正常消息）都会写入 `review_audit.jsonl`，并同步写入插件日志。每条记录含原文、本地规则分数、复核模型、LLM 原始输出（最多 10000 字符）、解析结论、原因和最终动作。这个文件与拦截病单 `incidents.jsonl` 分开；正常放行的消息不会私聊管理员。
+**复核审计**。所有实际调用过复核 LLM 的消息（包括复核后放行的正常消息）都会记一条审计。每条含原文、本地规则分数、复核模型、LLM 原始输出（最多 10000 字符）、解析结论、原因和最终动作。审计与拦截病单 `incidents.jsonl` 分开存放，查看方式有三条：
+
+- `!pg log`（推荐）——聊天里直接看，仅管理员可用
+- 审计文件本身——路径用 `!pg where` 查，不要去插件目录找
+- 打开「复核放行也私聊管理员」，把每条放行记录推送到管理员私聊
+
+插件日志面板看不到这些内容，那是 LangBot 侧的限制，见 v0.1.5 第 4 条。
 
 
 主战场是群聊。
@@ -184,7 +256,7 @@ python scripts/dump_rules.py
 
 `incidents.jsonl` 一行一条，字段包括时间、平台、群 id/群名、用户 id/昵称、完整原文、规则分数/原因、LLM 结论，以及本次私聊是否送达。管理员私聊 / 群内补发是同一份信息的可读版。
 
-把文件交给客服即可按群、按人回溯「谁在试着绕过提示词」。
+文件在哪用 `!pg where` 查（安装后不在你上传的那个目录，见 v0.1.5 第 2 条）。把文件交给客服即可按群、按人回溯「谁在试着绕过提示词」；临时看几条用 `!pg tickets`。
 
 ## 本地自检
 
@@ -192,9 +264,9 @@ python scripts/dump_rules.py
 python scripts/verify_ptd.py
 ```
 
-会检查：Python 语法、manifest YAML 可解析、PTD 对正常句 / 越狱句 / Unicode 混淆的分数、LLM JSON 解析、SDK 字段接线、病单写入、管理员 ID 解析。
+会检查：Python 语法、manifest YAML 可解析、PTD 对正常句 / 越狱句 / Unicode 混淆的分数、LLM JSON 解析、SDK 字段接线、只读目录下的记录路径回退、`!pg` 子命令分发与管理员门禁、组件发现、病单写入、管理员 ID 解析。共 68 项。
 
-其中 LLM 解析、SDK 接线、病单三组需要插件 SDK；没装则跳过而不是报错：
+其中 LLM 解析、SDK 接线、组件发现、`!pg` 命令、病单几组需要插件 SDK；没装则跳过而不是报错：
 
 ```bash
 python -m venv ~/.venvs/prompt-guardian
@@ -211,7 +283,9 @@ python -m venv ~/.venvs/prompt-guardian
 3. 机器人 **不要** 用主 LLM 回答该句
 4. 群里出现拦截提示（若未关闭）
 5. 管理员收到私聊病单；QQ 官方未填 AppID 时，群里会出现补发的病单
-6. `incidents.jsonl` 多一行，含群名、用户、原文、`notify_private_delivered`
+6. 管理员发 `!pg where`，能看到记录文件的实际绝对路径
+7. 管理员发 `!pg tickets`，刚才那条拦截出现在列表里；`!pg log` 能看到复核记录
+8. 按第 6 步给出的路径去查文件，`incidents.jsonl` 多了一行，含群名、用户、原文、`notify_private_delivered`
 
 ## 许可
 
