@@ -58,9 +58,12 @@ the absolute path the running process reports.
 The prefix follows your LangBot setting (`!` by default). Aliases: `logs`/`review`,
 `ticket`, `path`/`paths`, `stat`, `help`. **Admins only** — the caller must match
 **Admin user IDs** or be privileged (level ≥ 2) according to LangBot itself,
-because the records quote group members verbatim. The last 200 records are also
-kept in the plugin process's memory, so `!pg log` still answers even when no
-directory turns out to be writable (cleared on restart).
+because the records quote group members verbatim. Prefer running it in a DM with
+the bot rather than in the group: **Admin user IDs** usually holds the DM openid
+so the match works there, and the output would otherwise read someone's message
+back out in front of the whole group. The last 200 records are also kept in the
+plugin process's memory, so `!pg log` still answers even when no directory turns
+out to be writable (cleared on restart).
 
 **Why the log panel is permanently empty (LangBot side, not fixable here).**
 `PluginLogBuffer` has exactly one source, the plugin subprocess's stderr:
