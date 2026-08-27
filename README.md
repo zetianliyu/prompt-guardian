@@ -8,49 +8,52 @@ Chinese install notes: `readme/README_zh_Hans.md`.
 
 ## What changed in v0.1.5
 
-This release is about one complaint: the log panel is empty and the record files
-contain nothing. Two separate causes — one a plugin bug, one a LangBot limit.
+This release fixes log visibility and documents where the record files actually
+live.
 
-**Record files were being written next to the plugin code (fixed).** Whether that
-location exists where you looked, and whether it is writable at all, depends on
-which launch path your LangBot uses — SDK 0.5.5 has two, and neither of them is
-the directory you uploaded:
+**Correction: record writing was never broken.** On a normal install the plugin
+directory is writable and `review_audit.jsonl` / `incidents.jsonl` were being
+written there all along. A file that looks empty means nothing has been recorded
+yet — the plugin only writes a row when the review LLM is actually invoked or a
+message is actually blocked. The real problem was finding that directory, since
+it is not the directory you uploaded (see below).
 
-| Launch path | Plugin code lives at | Writable? |
-|---|---|---|
-| `mgr.py`, the traditional path | `data/plugins/<author>__<name>/`, which is also the cwd | Yes. The file was created — just not in the directory you uploaded |
-| `worker_launcher` + artifact store | `data/plugin-runtime/artifacts/sha256/<sha256>/code/` | **No.** `install_package()` calls `_make_tree_read_only()`, chmodding the tree to `0o555`/`0o444`; the shared profile also bind-mounts it read-only at `/plugin` with `--cwd /plugin` |
+The path resolution added here is a fallback, and **it changes nothing on a normal
+install**: `$PROMPT_GUARDIAN_DATA_DIR`, then `/data`, then the installation's
+`data/`, then the plugin directory (what a normal install picks, exactly as
+before), then `$HOME`, then the temp dir. Writability is decided by a real
+create-and-delete probe rather than `os.access`, because a read-only mount and a
+read-only chmod report differently through `access()` depending on the mount and
+the effective uid. An absolute path is still honoured.
 
-Both look identical from the outside: "I opened the plugin directory and there
-are no records." In the first case you were looking in the wrong directory; in
-the second every append raised `PermissionError` / `Read-only file system` — and
-since the ticket write only logged the failure and the log panel is dead, it made
-no sound at all. The `review_audit.jsonl` you can open in the plugin directory is
-a stale file from before packaging, not a runtime write. `incidents.jsonl` goes
-through the same code path; the admin DM working is what hid it.
+The fallback exists for LangBot's other launch path, the artifact store:
+`install_package()` calls `_make_tree_read_only()`, chmodding the extracted tree
+to `0o555`/`0o444`, and the shared profile bind-mounts it read-only at `/plugin`.
+Writing beside the code there raises `PermissionError` / `Read-only file system`,
+and since the ticket write only logs the failure and the log panel is dead, it
+would fail completely silently. Now it relocates and says so in `!pg where`.
 
-One more reason not to write beside the code: on upgrade or reinstall,
-`_activate_staged_plugin()` `os.replace`s the old directory into
-`data/.plugin-backups/` and then `rmtree`s it, taking any records with it.
-
-Record paths are now resolved to the first directory that survives a real
-create-and-delete probe: `$PROMPT_GUARDIAN_DATA_DIR`, then `/data`, then the
-installation's `data/`, then the plugin directory (traditional path or dev mode,
-when it really is writable), then `$HOME`, then the temp dir. An absolute path is
-still honoured; if its parent is not writable the plugin falls back and says so
-in `!pg where` instead of failing silently.
+**One caveat worth knowing** (not a bug, but it bites): installing a new version
+deletes and rebuilds the plugin directory — `install_plugin` `shutil.rmtree`s
+`data/plugins/<author>__<name>` and lands the staged copy in its place, and
+uninstall runs the same code. Records kept inside the plugin directory are
+therefore lost on every plugin upgrade. To keep history across versions, point
+**Incident log path** and **Review audit path** at an absolute path outside the
+plugin directory.
 
 **Where the plugin lives after you upload it.** Not in the directory you
-uploaded. Under the traditional path, relative to LangBot's own working
-directory:
+uploaded. On a normal install, relative to LangBot's own working directory:
 
 ```
 data/plugins/<author>__<name>/
 ```
 
-That is `/app/data/plugins/...` inside the container, and since the official
-compose file mounts `./data/plugins`, the same files are visible under your
-compose directory on the host. Under the artifact path:
+The record files default to that same directory. In Docker that is
+`/app/data/plugins/...`, and since compose mounts `./data`, the same files appear
+under your compose directory on the host; a bare-metal install has them under the
+LangBot directory's own `data/plugins/...`.
+
+Under the artifact path:
 
 | | Host path | Inside the sandbox |
 |---|---|---|

@@ -1228,6 +1228,16 @@ def check_record_store() -> None:
         os.makedirs(writable)
         os.chmod(readonly, 0o555)
         try:
+            # A writable plugin directory keeps being used, exactly as before —
+            # the fallback chain must not relocate records on a normal install.
+            installed = os.path.join(tmp, "langbot-data", "plugins", "dxzk__PromptGuardian")
+            os.makedirs(installed)
+            record_store.plugin_root = lambda: installed
+            os.environ.pop(record_store.ENV_DATA_DIR, None)
+            directory, label = record_store.resolve_dir(refresh=True)
+            if directory != installed:
+                fail(f"a writable plugin directory was not kept: {directory} ({label})")
+
             record_store.plugin_root = lambda: readonly
             if os.geteuid() != 0:
                 if not record_store.probe_writable(readonly):

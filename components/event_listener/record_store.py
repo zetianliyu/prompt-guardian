@@ -88,7 +88,8 @@ def candidates() -> list[tuple[str, str, bool]]:
         install_root = os.path.dirname(transfer.rstrip("/\\"))
         if install_root:
             out.append(("安装目录下的 data/", os.path.join(install_root, "data"), True))
-    out.append(("插件目录", plugin_root(), False))
+    root = plugin_root()
+    out.append(("插件目录", root, False))
     home = (os.environ.get("HOME") or "").strip()
     if home:
         out.append(("HOME", home, False))
