@@ -12,18 +12,25 @@ LangBot 4.x 插件。用 **规则预筛 + LLM 复核** 识别群聊里的提示�
 
 这一版专门解决「日志看不到、记录文件里什么都没有」。两件事，一件是插件的 bug，一件是 LangBot 侧的限制。
 
-### 1. 记录文件写不进去的真正原因（已修复）
+### 1. 记录文件为什么找不到（已修复）
 
-LangBot 安装插件时会把插件目录变成**只读**。`PluginArtifactStore.install_package()` 解压后调用 `_make_tree_read_only()`，把整棵目录树 chmod 成 `0o555` / `0o444`；生产用的 shared 进程配置还会用 nsjail 把它以只读方式挂到 `/plugin`，并把工作目录设成 `/plugin`。
+旧代码把 `review_audit.jsonl` / `incidents.jsonl` 写在**插件代码旁边**（按 `__file__` 往上找插件根目录）。问题是「插件代码旁边」在哪、能不能写，取决于 LangBot 用哪条启动路径——SDK 0.5.5 里有两条，你上传的那个目录都不是其中任何一条：
 
-所以 `review_audit.jsonl`、`incidents.jsonl` 这类相对路径落在只读目录里，每次追加都抛 `PermissionError` / `Read-only file system`。病单写入本来就套着 try/except 只打日志，而日志面板又是空的（见第 4 条），于是表现成「什么都没发生」。**你手动打开插件目录看到的那个 `review_audit.jsonl`，是打包前就存在的旧文件，不是运行时写的。** 拦截病单 `incidents.jsonl` 同样一直没写进去，只是私聊通知能发出去，掩盖了这一点。
+| 启动路径 | 插件代码位置 | 能写吗 |
+|---|---|---|
+| `mgr.py` 的传统路径 | `data/plugins/<作者>__<插件名>/`，工作目录就是这里 | 能写。文件确实生成了，只是不在你上传的目录里 |
+| `worker_launcher` + 制品仓库 | `data/plugin-runtime/artifacts/sha256/<sha256>/code/` | **不能**。`install_package()` 解压后调用 `_make_tree_read_only()`，整棵树 chmod 成 `0o555`/`0o444`；shared 配置还用 nsjail 以只读方式挂到 `/plugin` 并把工作目录设成 `/plugin` |
+
+两种情况的表象一样：「我打开插件目录，里面没有记录」。第一种是找错了目录，第二种是每次追加都抛 `PermissionError` / `Read-only file system`——病单写入本来就套着 try/except 只打日志，日志面板又是空的（见第 4 条），所以彻底没声音。你手动打开的那个 `review_audit.jsonl` 是打包前留下的旧文件，不是运行时写的。拦截病单 `incidents.jsonl` 走的是同一条代码路径，只是私聊通知能发出去，把这件事盖住了。
+
+还有一个理由不该写在代码旁边：升级或重装时 `_activate_staged_plugin()` 会把旧目录 `os.replace` 到 `data/.plugin-backups/` 再 `rmtree` 掉，写在那儿的记录会跟着被删。
 
 现在改为自动挑选可写目录，依次尝试：
 
 1. 环境变量 `PROMPT_GUARDIAN_DATA_DIR`
 2. `/data`（沙箱里每个安装实例的数据目录）
 3. 安装目录下的 `data/`
-4. 插件目录（只有开发模式下确实可写时才会命中）
+4. 插件目录（传统路径 / 开发模式下确实可写时才会命中）
 5. `$HOME`
 6. 临时目录
 
@@ -31,7 +38,17 @@ LangBot 安装插件时会把插件目录变成**只读**。`PluginArtifactStore
 
 ### 2. 插件上传 LangBot 之后在哪
 
-你的猜测是对的，目录确实变了。安装后插件不再是你上传的那份目录：
+你的猜测是对的，目录确实变了：安装后插件不在你上传的那份目录里。具体在哪取决于上面那两条启动路径。
+
+传统路径（相对 LangBot 自己的工作目录）：
+
+```
+data/plugins/<作者>__<插件名>/
+```
+
+Docker 里容器内是 `/app/data/plugins/...`，而 `docker-compose.yaml` 把 `./data/plugins` 挂进容器，所以宿主机上就是 compose 目录下的 `data/plugins/...`，可以直接翻。
+
+制品路径：
 
 | 内容 | 宿主机路径 | 沙箱内路径 |
 |---|---|---|
@@ -40,9 +57,9 @@ LangBot 安装插件时会把插件目录变成**只读**。`PluginArtifactStore
 | HOME | `data/plugin-runtime/installations/<uuid>/home/` | `/home` |
 | 临时目录 | `data/plugin-runtime/installations/<uuid>/tmp/` | `/tmp` |
 
-这些路径相对 LangBot 自己的工作目录。Docker 部署时容器内是 `/app/data/...`，宿主机上就是 compose 目录下的 `data/...`（`data/` 一般是挂载卷，所以能直接翻）。
+这些路径相对 LangBot 自己的工作目录。注意 `data/plugin-runtime/` 在官方 compose 里**没有**单独挂载卷，所以这一支在容器里是临时的。
 
-`<sha256>` 和 `<uuid>` 每次重装都会变，所以别去猜——在聊天里发 `!pg where`，它打印的是插件进程里实测出来的绝对路径。
+`<sha256>` 和 `<uuid>` 每次重装都会变，两条路径你也未必分得清用的是哪条——所以别去猜：在聊天里发 `!pg where`，它打印的是插件进程里实测出来的绝对路径，连挑目录时跳过了谁、为什么跳过都会列出来。
 
 ### 3. 新增 `!pg` 命令：在聊天里查记录
 
@@ -73,7 +90,7 @@ LangBot 安装插件时会把插件目录变成**只读**。`PluginArtifactStore
 
 于是 `process.stderr is None`，`start_reader()` 永不调用，面板没有任何来源。插件往 stderr 写什么、格式对不对，都不会出现在面板里。面板里唯一可能出现的内容是 LangBot 自己写的诊断条目（`log_buffer.add_entry()`）。
 
-要修得在 LangBot 侧给 `create_controller()` 补上 `capture_stderr=True`。那是上游改动，本插件没有动它。所以之前 v0.1.2 说「日志面板现在会有内容」是错的，这里更正。
+要修得在 LangBot 侧给 `create_controller()` 补上 `capture_stderr=True`。这一行本来是有的（2026-06-13 那个「把插件 stderr 收进环形缓冲」的提交里就写着 `capture_stderr=True`），在 2026-07-23 的一次生命周期重构里被删掉，之后一直没回来。也就是说这是上游的回归，不是没做的功能——将来上游修回去，面板会自己恢复。本插件没有去改它。所以之前 v0.1.2 说「日志面板现在会有内容」是错的，这里更正。
 
 ### 5. 其它
 

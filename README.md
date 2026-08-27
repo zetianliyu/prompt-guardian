@@ -11,28 +11,46 @@ Chinese install notes: `readme/README_zh_Hans.md`.
 This release is about one complaint: the log panel is empty and the record files
 contain nothing. Two separate causes — one a plugin bug, one a LangBot limit.
 
-**Record files could not be written at all (fixed).** LangBot installs a plugin
-as a verified **read-only** artifact: `PluginArtifactStore.install_package()`
-calls `_make_tree_read_only()`, which chmods the extracted tree to `0o555`/`0o444`,
-and the production worker profile additionally bind-mounts it read-only at
-`/plugin` inside nsjail with `--cwd /plugin`. A relative path such as
-`review_audit.jsonl` therefore landed inside a read-only tree and every append
-raised `PermissionError` / `Read-only file system`. The ticket write was already
-wrapped in a `try/except` that only logged, and the log panel is dead, so it
-looked like nothing happened at all. The `review_audit.jsonl` you can open in
-the plugin directory is a stale file from before packaging — not a runtime
-write. `incidents.jsonl` was silently failing the same way; the admin DM working
-is what hid it.
+**Record files were being written next to the plugin code (fixed).** Whether that
+location exists where you looked, and whether it is writable at all, depends on
+which launch path your LangBot uses — SDK 0.5.5 has two, and neither of them is
+the directory you uploaded:
+
+| Launch path | Plugin code lives at | Writable? |
+|---|---|---|
+| `mgr.py`, the traditional path | `data/plugins/<author>__<name>/`, which is also the cwd | Yes. The file was created — just not in the directory you uploaded |
+| `worker_launcher` + artifact store | `data/plugin-runtime/artifacts/sha256/<sha256>/code/` | **No.** `install_package()` calls `_make_tree_read_only()`, chmodding the tree to `0o555`/`0o444`; the shared profile also bind-mounts it read-only at `/plugin` with `--cwd /plugin` |
+
+Both look identical from the outside: "I opened the plugin directory and there
+are no records." In the first case you were looking in the wrong directory; in
+the second every append raised `PermissionError` / `Read-only file system` — and
+since the ticket write only logged the failure and the log panel is dead, it made
+no sound at all. The `review_audit.jsonl` you can open in the plugin directory is
+a stale file from before packaging, not a runtime write. `incidents.jsonl` goes
+through the same code path; the admin DM working is what hid it.
+
+One more reason not to write beside the code: on upgrade or reinstall,
+`_activate_staged_plugin()` `os.replace`s the old directory into
+`data/.plugin-backups/` and then `rmtree`s it, taking any records with it.
 
 Record paths are now resolved to the first directory that survives a real
 create-and-delete probe: `$PROMPT_GUARDIAN_DATA_DIR`, then `/data`, then the
-installation's `data/`, then the plugin directory (dev mode only), then `$HOME`,
-then the temp dir. An absolute path is still honoured; if its parent is not
-writable the plugin falls back and says so in `!pg where` instead of failing
-silently.
+installation's `data/`, then the plugin directory (traditional path or dev mode,
+when it really is writable), then `$HOME`, then the temp dir. An absolute path is
+still honoured; if its parent is not writable the plugin falls back and says so
+in `!pg where` instead of failing silently.
 
-**Where the plugin lives after you upload it.** The installed plugin is not the
-directory you uploaded:
+**Where the plugin lives after you upload it.** Not in the directory you
+uploaded. Under the traditional path, relative to LangBot's own working
+directory:
+
+```
+data/plugins/<author>__<name>/
+```
+
+That is `/app/data/plugins/...` inside the container, and since the official
+compose file mounts `./data/plugins`, the same files are visible under your
+compose directory on the host. Under the artifact path:
 
 | | Host path | Inside the sandbox |
 |---|---|---|
@@ -41,10 +59,11 @@ directory you uploaded:
 | HOME | `data/plugin-runtime/installations/<uuid>/home/` | `/home` |
 | Temp | `data/plugin-runtime/installations/<uuid>/tmp/` | `/tmp` |
 
-Paths are relative to LangBot's own working directory — `/app/data/...` in the
-container, so `data/...` under your compose directory on the host. `<sha256>`
-and `<uuid>` change on every reinstall, so don't guess: run `!pg where` and read
-the absolute path the running process reports.
+`data/plugin-runtime/` has no volume of its own in the official compose file, so
+that branch is ephemeral in a container. `<sha256>` and `<uuid>` change on every
+reinstall, and you cannot easily tell which path your install uses — so don't
+guess: run `!pg where` and read the absolute path the running process reports,
+along with which candidate directories it skipped and why.
 
 **New `!pg` command — read the records from chat.**
 
@@ -74,9 +93,13 @@ self.capture_stderr else None`), and `worker_launcher.create_controller()` never
 passes it — `capture_stderr=True` appears zero times in SDK 0.5.5. So
 `process.stderr is None`, `start_reader()` is never called, and the panel has no
 source no matter what the plugin writes. Only LangBot's own diagnostic entries
-(`log_buffer.add_entry()`) can appear there. Fixing it means adding
-`capture_stderr=True` upstream; this plugin does not touch that. The v0.1.2 note
-claiming the panel would now have content was wrong, and is retracted here.
+(`log_buffer.add_entry()`) can appear there. That line used to be present — the
+2026-06-13 commit that added the per-plugin stderr ring buffer passed
+`capture_stderr=True` — and was dropped in a lifecycle refactor on 2026-07-23,
+so this is an upstream regression rather than an unbuilt feature: if upstream
+restores it, the panel starts working on its own. This plugin does not touch it.
+The v0.1.2 note claiming the panel would now have content was wrong, and is
+retracted here.
 
 The offline suite is now 68 checks, adding the read-only path fallback, the
 memory fallback, `!pg` dispatch with its admin gate, and discovery of both
