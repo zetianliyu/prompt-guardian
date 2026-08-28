@@ -4,7 +4,7 @@ metadata:
   author: dxzk
   name: PromptGuardian
   repository: 'https://github.com/zetianliyu/prompt-guardian'
-  version: 0.1.6
+  version: 0.1.7
   description:
     en_US: Rule-based plus LLM-reviewed prompt-injection guard. Blocks jailbreaks in group chats and files a ticket (group, user, question) for human follow-up.
     zh_Hans: 规则预筛 + LLM 复核的提示词注入防护。拦截群聊越狱，并记录「哪个群、哪个用户、问了什么」供人工客服处理。

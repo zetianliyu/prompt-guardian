@@ -120,6 +120,32 @@ def has_scope_signal(analysis: dict[str, Any]) -> bool:
     )
 
 
+def local_hit_summary(analysis: dict[str, Any], limit: int = 4) -> str:
+    """Readable local hits for the review prompt.
+
+    Deliberately not ``analysis["reason"]``: that embeds raw regex source, and a
+    reviewer that quoted ``[\\s\\S]`` back into its JSON string produced an
+    invalid escape, which threw an otherwise correct verdict away. Only scope
+    labels and plain descriptions go to the model, with backslashes stripped.
+    """
+    counts: dict[str, int] = {}
+    for signal in analysis.get("signals") or []:
+        label = str(signal.get("origin") or "").strip()
+        if not label:
+            label = str(signal.get("description") or signal.get("name") or "").strip()
+        label = label.replace("\\", " ").strip()
+        if not label:
+            continue
+        counts[label] = counts.get(label, 0) + 1
+    parts = [
+        f"{label}（{count} 条规则）" if count > 1 else label
+        for label, count in list(counts.items())[:limit]
+    ]
+    if len(counts) > limit:
+        parts.append("等")
+    return "、".join(parts)
+
+
 class RuleOverrides:
     def __init__(
         self,

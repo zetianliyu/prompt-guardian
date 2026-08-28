@@ -22,7 +22,12 @@ from plugin_log import log  # noqa: E402
 from ptd_core import PromptThreatDetector  # noqa: E402
 import record_store  # noqa: E402
 from recorder import IncidentRecorder, NotifyResult, _safe_str  # noqa: E402
-from rule_overrides import RuleOverrides, config_fingerprint, has_scope_signal  # noqa: E402
+from rule_overrides import (  # noqa: E402
+    RuleOverrides,
+    config_fingerprint,
+    has_scope_signal,
+    local_hit_summary,
+)
 
 LLM_CONFIDENCE_THRESHOLD = 0.6
 RULE_BLOCK_SEVERITIES = {"medium", "high"}
@@ -82,10 +87,16 @@ def parse_llm_response(text: str) -> dict[str, Any]:
     for start, char in enumerate(text):
         if char != "{":
             continue
-        try:
-            data, _ = decoder.raw_decode(text[start:])
-        except (json.JSONDecodeError, TypeError):
-            continue
+        candidate = text[start:]
+        data: Any = None
+        # Second attempt repairs invalid escapes: a reviewer quoting a regex is
+        # not a malformed verdict, it is a malformed string literal.
+        for attempt in (candidate, repair_json_escapes(candidate)):
+            try:
+                data, _ = decoder.raw_decode(attempt)
+                break
+            except (json.JSONDecodeError, TypeError):
+                data = None
         if not isinstance(data, dict):
             continue
         is_injection = data.get("is_injection")
@@ -111,6 +122,47 @@ def parse_llm_response(text: str) -> dict[str, Any]:
             "attempted": True,
         }
     return fallback
+
+
+_JSON_ESCAPES = set('"\\/bfnrt')
+
+
+def repair_json_escapes(text: str) -> str:
+    """Double every backslash that does not begin a valid JSON escape.
+
+    A reviewer that quotes a regex back at us — ``[\\s\\S]`` is the one that
+    actually happened — emits ``\\s`` inside a JSON string, which ``json.loads``
+    rejects with ``Invalid \\escape``. The verdict itself is perfectly good, so
+    repair the transport instead of throwing the review away and failing open.
+    Well-formed JSON is returned unchanged.
+    """
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        following = text[index + 1] if index + 1 < length else ""
+        if following == "u" and _is_hex4(text[index + 2 : index + 6]):
+            out.append(text[index : index + 6])
+            index += 6
+            continue
+        if following in _JSON_ESCAPES:
+            out.append(char)
+            out.append(following)
+            index += 2
+            continue
+        out.append("\\\\")
+        out.append(following)
+        index += 2 if following else 1
+    return "".join(out)
+
+
+def _is_hex4(chunk: str) -> bool:
+    return len(chunk) == 4 and all(char in "0123456789abcdefABCDEF" for char in chunk)
 
 
 def llm_confirms_injection(llm: dict[str, Any] | None) -> bool:
@@ -525,9 +577,7 @@ class DefaultEventListener(EventListener):
         if review_requested:
             review_model_uuid = _safe_str(cfg.get("review_llm_model"), "")
             review_model_uuid = await self._pick_review_model(review_model_uuid)
-            prompt = scope.build_review_prompt(
-                text, _safe_str(analysis.get("reason"), "")
-            )
+            prompt = scope.build_review_prompt(text, local_hit_summary(analysis))
             if review_model_uuid and prompt:
                 llm_result = await self._llm_review(text, review_model_uuid, prompt)
             else:

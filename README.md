@@ -6,6 +6,38 @@ This is **not** an AstrBot plugin. The detection rule library (PTD 4.1.0) comes 
 
 Chinese install notes: `readme/README_zh_Hans.md`.
 
+## What changed in v0.1.7
+
+Fixes a bug introduced in 0.1.6: **the reviewer returned the right verdict and it
+was thrown away as "unparseable", so the message was allowed through.**
+
+The raw reply from the model was:
+
+```json
+{"is_injection": true, "confidence": 0.92, "reason": "…匹配本地规则中的正则模式「(每个|分别|逐条|逐个)[\s\S]{0,80}(数据来源|来源依据|知识库条目)」…"}
+```
+
+The verdict is correct, but `json.loads` rejects it with `Invalid \escape`: a JSON
+string may only carry `\" \\ \/ \b \f \n \r \t \uXXXX`, and `\s` is none of those.
+The whole object was discarded and the message failed open.
+
+The cause was mine: 0.1.6 fed the local hit reason into the review prompt, and
+that reason embeds **raw regex source** (`命中正则「…[\s\S]…」`). The model quoted
+it back into its own `reason`, producing the invalid escape. Both halves are
+fixed:
+
+1. **No regex source reaches the prompt.** The local-hit line is now scope labels
+   and match counts — "打探知识库/数据来源（3 条规则）" — with backslashes stripped.
+   Tickets and `!pg log` still show the pattern that matched, since those never
+   go to a model.
+2. **The parser repairs invalid escapes.** It decodes the reply as-is first, then
+   retries with every backslash that does not begin a valid JSON escape doubled.
+   Well-formed JSON is untouched. This is the backstop: a user message containing
+   `[\s\S]` can provoke the same echo regardless of what the prompt says.
+
+The suite is 86 checks, adding that exact production reply (must parse and block),
+that repair leaves valid JSON alone, and that no backslash reaches the prompt.
+
 ## What changed in v0.1.6
 
 Three problems: the config page was too long for an operator to use, custom
