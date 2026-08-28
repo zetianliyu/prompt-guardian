@@ -120,30 +120,55 @@ def has_scope_signal(analysis: dict[str, Any]) -> bool:
     )
 
 
-def local_hit_summary(analysis: dict[str, Any], limit: int = 4) -> str:
-    """Readable local hits for the review prompt.
+SUMMARY_SNIPPETS_PER_ORIGIN = 3
+SUMMARY_SNIPPET_CHARS = 40
 
-    Deliberately not ``analysis["reason"]``: that embeds raw regex source, and a
-    reviewer that quoted ``[\\s\\S]`` back into its JSON string produced an
-    invalid escape, which threw an otherwise correct verdict away. Only scope
-    labels and plain descriptions go to the model, with backslashes stripped.
+
+def local_hit_summary(analysis: dict[str, Any], limit: int = 4) -> str:
+    """Readable local hits for the review prompt, including what matched.
+
+    Two things this must get right, both learned the hard way:
+
+    * No raw regex source. A reviewer that quoted ``[\\s\\S]`` back into its JSON
+      string produced an invalid escape and an otherwise correct verdict was
+      thrown away.
+    * The matched *text* has to be here. Given only a scope label, a reviewer
+      handed a long mostly-benign message summarises the bulk of it and clears
+      the one in-scope clause at the end. Naming the fragments points it at the
+      part that actually matched.
     """
-    counts: dict[str, int] = {}
+    grouped: dict[str, list[str]] = {}
     for signal in analysis.get("signals") or []:
         label = str(signal.get("origin") or "").strip()
         if not label:
             label = str(signal.get("description") or signal.get("name") or "").strip()
-        label = label.replace("\\", " ").strip()
+        label = _clean_fragment(label)
         if not label:
             continue
-        counts[label] = counts.get(label, 0) + 1
-    parts = [
-        f"{label}（{count} 条规则）" if count > 1 else label
-        for label, count in list(counts.items())[:limit]
-    ]
-    if len(counts) > limit:
+        bucket = grouped.setdefault(label, [])
+        snippet = _clean_fragment(str(signal.get("detail") or ""))
+        if snippet and snippet not in bucket:
+            bucket.append(snippet)
+
+    parts: list[str] = []
+    for label, snippets in list(grouped.items())[:limit]:
+        # Shortest first: the tight, distinctive fragments are the useful ones,
+        # a long span matched by a wide regex is just the message again.
+        chosen = sorted(snippets, key=len)[:SUMMARY_SNIPPETS_PER_ORIGIN]
+        quoted = "".join(f"「{_clip_fragment(snippet)}」" for snippet in chosen)
+        parts.append(f"{label}：命中{quoted}" if quoted else label)
+    if len(grouped) > limit:
         parts.append("等")
-    return "、".join(parts)
+    return "\n".join(parts)
+
+
+def _clean_fragment(text: str) -> str:
+    """Collapse whitespace and drop backslashes before anything reaches a model."""
+    return " ".join(text.replace("\\", " ").split())
+
+
+def _clip_fragment(text: str, limit: int = SUMMARY_SNIPPET_CHARS) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 class RuleOverrides:

@@ -1609,6 +1609,31 @@ def check_scope_rules() -> None:
         fail("an empty scope must not produce a review prompt")
     ok("an empty scope selection produces no criteria")
 
+    # 9. The reviewer needs the matched *text*, not just a scope label. Given
+    #    only "打探知识库/数据来源", a reviewer handed this long mostly-benign
+    #    message summarised the bulk of it and cleared the demand at the end.
+    from rule_overrides import local_hit_summary
+
+    _, production = analyse({"scope_knowledge": True}, PRODUCTION_Q)
+    summary = local_hit_summary(production)
+    if "每个给出相关处理办法" not in summary:
+        fail(f"the summary does not name the offending clause: {summary!r}")
+    if "\\" in summary:
+        fail(f"the summary leaks a backslash to the model: {summary!r}")
+    if "[" in summary or "]" in summary:
+        fail(f"the summary leaks regex source: {summary!r}")
+    per_origin = summary.count("」")
+    if per_origin > 3:
+        fail(f"expected at most 3 snippets per scope, got {per_origin}")
+
+    production_prompt = analyse({"scope_knowledge": True}, PRODUCTION_Q)[
+        0
+    ].scope.build_review_prompt(PRODUCTION_Q, summary)
+    for needle in ("任何一部分", "篇幅更长", "必须指出是哪一句"):
+        if needle not in production_prompt:
+            fail(f"the prompt lost its anti-dilution rule ({needle})")
+    ok("the prompt names the matched fragments and forbids majority-rules judging")
+
 
 def check_scope_review_flow() -> None:
     """Scope rules recall; the reviewer decides. Nothing blocks without review.
@@ -1769,6 +1794,8 @@ def check_scope_review_flow() -> None:
             fail("the production message was never reviewed")
         if "\\" in prompts[0]:
             fail("regex source leaked into the review prompt, inviting invalid escapes")
+        if "每个给出相关处理办法" not in prompts[0]:
+            fail("the prompt did not point the reviewer at the matched clause")
         if not blocked:
             fail("a confirmed verdict quoting a regex failed open instead of blocking")
         ok("the production message blocks even when the verdict quotes a regex")
