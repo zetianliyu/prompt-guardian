@@ -4,7 +4,7 @@ metadata:
   author: dxzk
   name: PromptGuardian
   repository: 'https://github.com/zetianliyu/prompt-guardian'
-  version: 0.1.5
+  version: 0.1.6
   description:
     en_US: Rule-based plus LLM-reviewed prompt-injection guard. Blocks jailbreaks in group chats and files a ticket (group, user, question) for human follow-up.
     zh_Hans: 规则预筛 + LLM 复核的提示词注入防护。拦截群聊越狱，并记录「哪个群、哪个用户、问了什么」供人工客服处理。
@@ -58,6 +58,94 @@ spec:
         en_US: Model used for semantic review. Empty = first available model. If no model is configured, medium/high rule hits are blocked without LLM review.
         zh_Hans: 语义复核使用的模型。留空则用第一个可用模型。若系统里没有任何模型，则按规则 medium/high 直接拦截。
       default: ''
+      required: false
+
+    - name: scope_jailbreak
+      type: boolean
+      label:
+        en_US: Scope — prompt injection / jailbreak
+        zh_Hans: 拦截对象：提示词注入/越狱
+      description:
+        en_US: "Recall rules plus the review criteria for injection, jailbreaks, DAN and role-play breakouts. Uses the built-in PTD 4.1 library."
+        zh_Hans: "拦这一类：提示词注入、越狱、忽略规则、DAN、角色扮演突破。用内置 PTD 4.1 规则库，无需再加词。"
+      default: true
+      required: false
+
+    - name: scope_knowledge
+      type: boolean
+      label:
+        en_US: Scope — probing the knowledge base / data sources
+        zh_Hans: 拦截对象：打探知识库/数据来源
+      description:
+        en_US: "Users asking which knowledge-base entry an answer came from, entry numbers, retrieval sources, or per-item data provenance."
+        zh_Hans: "拦这一类：追问答案出自哪条知识库、条目编号、检索来源、逐条给出数据来源依据。「知识库里有退款政策吗」这种业务咨询不拦。"
+      default: false
+      required: false
+
+    - name: scope_tooling
+      type: boolean
+      label:
+        en_US: Scope — probing plugins / MCP / tool lists
+        zh_Hans: 拦截对象：打探插件/MCP/工具列表
+      description:
+        en_US: "Users probing which plugins, MCP servers, tools or vector stores the bot runs."
+        zh_Hans: "拦这一类：打探机器人接了哪些插件、MCP、工具列表、向量库。问 App 产品自己的插件怎么装不拦。"
+      default: false
+      required: false
+
+    - name: scope_nsfw
+      type: boolean
+      label:
+        en_US: Scope — sexual / adult content
+        zh_Hans: 拦截对象：色情/18禁
+      description:
+        en_US: "Sexual and adult content. Medical, sex-harassment complaints and age-rating questions stay allowed."
+        zh_Hans: "拦这一类：色情、18禁、露骨性描写。医学科普、性骚扰投诉、年龄分级说明不拦。"
+      default: false
+      required: false
+
+    - name: scope_custom_targets
+      type: array[string]
+      label:
+        en_US: Custom blocking objects
+        zh_Hans: 自定义拦截对象
+      description:
+        en_US: "One plain-language object per line, e.g. `竞品报价`. The name itself becomes a recall keyword and is written into the review criteria — do not write prompts here."
+        zh_Hans: "每行一个对象名，白话即可，例如 `竞品报价`、`内部工号`。名字本身会当成召回关键词，并写进复核标准。这里不要写提示词。"
+      default: []
+      required: false
+
+    - name: scope_keywords
+      type: array[string]
+      label:
+        en_US: Extra keywords
+        zh_Hans: 补充关键词
+      description:
+        en_US: "Gap-filling for the scopes above, one `keyword:weight` per line (1-10, defaults to 5)."
+        zh_Hans: "给上面的拦截对象补漏词，不是独立功能。每行 `关键词:权重`（1-10，省略按 5）。"
+      default: []
+      required: false
+
+    - name: scope_regex
+      type: array[string]
+      label:
+        en_US: Extra regexes
+        zh_Hans: 补充正则
+      description:
+        en_US: "Gap-filling for the scopes above, one `pattern:weight` per line. Python regex, case-insensitive; invalid patterns are skipped with a log line."
+        zh_Hans: "同上，每行 `正则:权重`。Python 正则，不区分大小写；写错的会跳过并打日志。避免嵌套量词。"
+      default: []
+      required: false
+
+    - name: disabled_rule_names
+      type: array[string]
+      label:
+        en_US: Disabled built-in rules
+        zh_Hans: 停用的内置规则
+      description:
+        en_US: "Built-in rule names to switch off, one per line. Catalogue: `docs/RULES.md`."
+        zh_Hans: "要关掉的内置规则名，每行一个。清单见 `docs/RULES.md`。"
+      default: []
       required: false
 
     - name: admin_user_ids
@@ -311,39 +399,6 @@ spec:
         en_US: "Score at which a message becomes `high`. Must be >= the medium threshold. PTD 4.1.0 default: 11."
         zh_Hans: "达到多少分算 high。必须不小于 medium 阈值，否则自动抬到与之相等。规则库默认 11。"
       default: 11
-      required: false
-
-    - name: custom_keywords
-      type: array[string]
-      label:
-        en_US: Custom keywords
-        zh_Hans: 自定义关键词
-      description:
-        en_US: "One per line as `keyword:weight` (weight 1-10, defaults to 5). Case-insensitive substring match. Example: `帮我绕过审核:5`"
-        zh_Hans: "每行一条，格式 `关键词:权重`（权重 1-10，省略则按 5）。不区分大小写的子串匹配。例：`帮我绕过审核:5`"
-      default: []
-      required: false
-
-    - name: custom_regex_rules
-      type: array[string]
-      label:
-        en_US: Custom regex rules
-        zh_Hans: 自定义正则规则
-      description:
-        en_US: "One per line as `pattern:weight` (weight 1-10, defaults to 5). Python regex, case-insensitive. A trailing `:number` is read as the weight only when it is 1-10, so `\\d{2}:\\d{2}` stays intact. Invalid patterns are skipped with a log line. Avoid nested quantifiers — a catastrophic pattern can stall the handler."
-        zh_Hans: "每行一条，格式 `正则:权重`（权重 1-10，省略则按 5）。Python 正则，不区分大小写。结尾的 `:数字` 只有落在 1-10 时才当权重，所以 `\\d{2}:\\d{2}` 不会被截断。写错的正则会跳过并打日志。请避免嵌套量词，灾难性回溯会卡住处理流程。"
-      default: []
-      required: false
-
-    - name: disabled_rule_names
-      type: array[string]
-      label:
-        en_US: Disabled built-in rules
-        zh_Hans: 停用的内置规则
-      description:
-        en_US: "Rule names to switch off, one per line — use this when a built-in rule keeps flagging legitimate messages. Works for both regex rule names and built-in keywords. Full catalogue: `docs/RULES.md` in the plugin directory."
-        zh_Hans: "要关掉的规则名，每行一个——某条内置规则老是误杀正常消息时用它。正则规则名和内置关键词都适用。完整清单见插件目录下的 `docs/RULES.md`。"
-      default: []
       required: false
   components:
     EventListener:

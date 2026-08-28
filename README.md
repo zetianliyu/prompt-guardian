@@ -6,6 +6,66 @@ This is **not** an AstrBot plugin. The detection rule library (PTD 4.1.0) comes 
 
 Chinese install notes: `readme/README_zh_Hans.md`.
 
+## What changed in v0.1.6
+
+Three problems: the config page was too long for an operator to use, custom
+rules were recalled but then waved through by a reviewer still judging on
+jailbreak criteria, and 0.1.5's "a custom hit blocks immediately" shortcut
+over-blocked.
+
+**A single "blocking scope" block, right under Review LLM.** Four booleans
+(LangBot's manifest has no checkbox-group, and "what to block" is genuinely
+multi-select, so adjacent booleans are the honest rendering):
+
+| Setting | Default |
+|---|---|
+| Scope — prompt injection / jailbreak | **on** (uses the built-in PTD 4.1 library) |
+| Scope — probing the knowledge base / data sources | off |
+| Scope — probing plugins / MCP / tool lists | off |
+| Scope — sexual / adult content | off |
+| Custom blocking objects | empty — one plain-language name per line |
+| Extra keywords | empty — `keyword:weight`, gap-filling only |
+| Extra regexes | empty — `pattern:weight`, gap-filling only |
+
+**Ticking a scope enables its rule pack *and* its review criteria.** That
+pairing is the fix: previously an operator could add 数据来源依据 as a keyword,
+watch the rule match, and still see the message allowed — because the prompt
+only ever asked about jailbreaks. A custom object contributes its own name as a
+recall keyword (weight 5) plus one criteria line; no model is called to expand
+it, and there is no "write your review prompt here" textarea.
+
+`custom_keywords` / `custom_regex_rules` are gone from the page, renamed **Extra
+keywords / Extra regexes** and folded into this block; `disabled_rule_names`
+follows it. Old values are still read and merged in, so an upgrade does not
+silently drop what the operator typed.
+
+**The review prompt is assembled from what is ticked.** Each enabled pack
+contributes its criteria and counter-examples, each custom object one line, then
+a shared instruction: anything belonging to one of these objects is
+`is_injection=true`, ordinary support/business/gaming context is `false`, and do
+not judge by classic jailbreak standards alone. An unticked scope's criteria
+never appear, so unticking adult content really does stop the reviewer judging
+on it.
+
+**Scope rules only recall; the reviewer decides.** `custom_rules_are_final` is
+ignored whether stored true or false. Pack keywords weigh 5-6 and a whole pack
+adds at most 6 however many of its rules match, so one pack lands at `low` —
+enough for `standby` to review, never enough to reach `medium` (7) and block on
+its own.
+
+**With injection/jailbreak unticked**, PTD keeps scoring jailbreaks but that
+score is no longer a reason to review or block, unless another pack, custom
+object or extra rule matched. Unticking it really disables that scope instead of
+leaving a stale criterion in force. `disabled` mode keeps its rules-only
+contract. If nothing at all is ticked and no custom object is named, there is no
+criterion, every message passes, and the plugin logs a warning.
+
+The offline suite is 83 checks, adding pack recall and the weight cap, prompt
+contents with a scope on and off, cross-line regexes, custom objects, legacy key
+merging, `custom_rules_are_final` being inert, and the unticked-jailbreak
+behaviour. New file `components/event_listener/scope_packs.py`; `ptd_core.py` is
+untouched.
+
 ## What changed in v0.1.5
 
 This release fixes log visibility and documents where the record files actually
@@ -151,10 +211,11 @@ Tickets now carry `notify_platform` / `notify_transport`. The offline suite runs
 GroupNormalMessageReceived
   → whitelist / disabled / empty text → pass
   → PTD 4.1 local score (no LLM cost)
-  → operator overrides (disabled rules, custom rules, thresholds)
+  → add the enabled scopes: ticked packs + custom object names + extra rules
+  → apply disabled-rule names and thresholds
   → standby + severity none → pass
-  → invoke_llm semantic review (optional)
-  → confirmed injection → prevent_default
+  → invoke_llm semantic review, with the ticked scopes as its criteria
+  → review confirms → prevent_default
        write incidents.jsonl
        private-message admins (QQ official uses HTTP C2C; otherwise group fallback)
        optional group refusal
@@ -165,6 +226,11 @@ LLM review modes (same meaning as the AstrBot prototype):
 - `standby` (default): review only when rules return a non-`none` severity
 - `active`: review every group message
 - `disabled`: rules only; block on `medium` / `high`
+
+Scope rules exist to recall, not to decide: a pack adds at most 6 points however
+many of its rules match, which keeps a single pack at `low` — enough to trigger
+review, below the `medium` block threshold — so the reviewer gets the chance to
+clear an ordinary support question.
 
 LLM JSON must report `is_injection: true` **and** `confidence >= 0.6` to confirm. The review prompt now requires a valid JSON object with concrete values, not placeholder text. If a review was actually attempted but its output is malformed, the message fails open; if no model is configured, local `medium` / `high` rules remain authoritative.
 
@@ -314,11 +380,12 @@ phrasing, which makes that more likely. Ask for fewer rows: `!pg log 1` or
 
 ## Managing the rule library
 
-The library ships **52 regex rules**, **136 weighted keywords**, 58 suspicious phrases and a set of derived signals. Weights add up; a message is only blocked once the total reaches a threshold. All of it is managed from the plugin config page:
+The library ships **52 regex rules**, **136 weighted keywords**, 58 suspicious phrases and a set of derived signals, all covering the injection/jailbreak scope. Weights add up; a message is only blocked once the total reaches a threshold. All of it is managed from the plugin config page:
 
-- **Thresholds** — `medium` = 7, `high` = 11 by default. Raise them when legitimate messages get flagged; lower them when attacks slip through. Try this before disabling rules.
-- **Custom keywords** — one `keyword:weight` per line, e.g. `帮我绕过审核:5`.
-- **Custom regexes** — one `pattern:weight` per line, e.g. `内部\s*工号\s*\d{4,}:7`. A trailing `:number` is read as the weight only when it lands in 1-10, so a pattern like `\d{2}:\d{2}` keeps its last segment. Broken patterns are skipped with a log line.
+- **Blocking scope** — tick what you want blocked. Each tick brings both a rule pack and its review criteria, so there is nothing to write by hand. Start here.
+- **Thresholds** — `medium` = 7, `high` = 11 by default. Raise them when legitimate messages get flagged; lower them when attacks slip through. Try this before disabling rules. A scope pack is capped at 6, so thresholds mostly move PTD's jailbreak scoring.
+- **Extra keywords** — one `keyword:weight` per line, e.g. `帮我绕过审核:5`. Gap-filling for the ticked scopes.
+- **Extra regexes** — one `pattern:weight` per line, e.g. `内部\s*工号\s*\d{4,}:7`. A trailing `:number` is read as the weight only when it lands in 1-10, so a pattern like `\d{2}:\d{2}` keeps its last segment. Broken patterns are skipped with a log line. Values stored in 0.1.5's `custom_keywords` / `custom_regex_rules` are merged in here.
 - **Disabled built-in rules** — one rule name per line. Works for regex rule names, built-in keywords and derived signal names.
 
 `docs/RULES.md` is the full catalogue (name, weight, description for every rule) and ships with the plugin — you need it to know what to type into the disable list. Regenerate it after a rule-library upgrade:
@@ -378,7 +445,7 @@ Each line of `incidents.jsonl`:
 python scripts/verify_ptd.py
 ```
 
-Checks syntax, manifest YAML, PTD scoring (benign / jailbreak / Unicode obfuscation), LLM JSON parsing, record-path fallback on a read-only directory, `!pg` subcommand dispatch and its admin gate, component discovery, and the incident recorder. 68 checks in total.
+Checks syntax, manifest YAML, PTD scoring (benign / jailbreak / Unicode obfuscation), scope-pack recall and the per-pack weight cap, review-prompt contents with a scope on and off, LLM JSON parsing, record-path fallback on a read-only directory, `!pg` subcommand dispatch and its admin gate, component discovery, and the incident recorder. 83 checks in total.
 
 The LLM-parser, SDK-wiring and recorder checks need the plugin SDK. Without it they are skipped rather than failing:
 
