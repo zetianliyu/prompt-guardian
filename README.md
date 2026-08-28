@@ -26,10 +26,11 @@ that reason embeds **raw regex source** (`命中正则「…[\s\S]…」`). The 
 it back into its own `reason`, producing the invalid escape. Both halves are
 fixed:
 
-1. **No regex source reaches the prompt.** The local-hit line is now scope labels
-   and match counts — "打探知识库/数据来源（3 条规则）" — with backslashes stripped.
-   Tickets and `!pg log` still show the pattern that matched, since those never
-   go to a model.
+1. **No regex source reaches the prompt.** The local-hit line was cut back to scope
+   labels and match counts — "打探知识库/数据来源（3 条规则）" — with backslashes
+   stripped. (The second fix below revises this line again: it carries the matched
+   user text now, still no regex.) Tickets and `!pg log` still show the pattern
+   that matched, since those never go to a model.
 2. **The parser repairs invalid escapes.** It decodes the reply as-is first, then
    retries with every backslash that does not begin a valid JSON escape doubled.
    Well-formed JSON is untouched. This is the backstop: a user message containing
